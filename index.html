@@ -347,6 +347,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       base = rest + 0.10 * tot.k;                                   // + efecto térmico de la comida
       exercise = num(h.active) + (S.settings.healthHasWorkouts ? 0 : manual);
       source = 'salud';
+      // Sin reloj, Salud apenas registra actividad: si queda por debajo de la fórmula (reposo + actividad diaria típica), manda la fórmula.
+      var fBase = B * (ACT[S.profile.activity] || ACT.lig).f;
+      if (base + exercise < fBase + manual) { base = fBase; exercise = manual; source = 'formula'; }
     } else {
       base = B * (ACT[S.profile.activity] || ACT.lig).f;
       exercise = manual;
