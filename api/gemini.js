@@ -16,16 +16,24 @@ module.exports = async (req, res) => {
   const payload = JSON.stringify({ contents: b.contents, generationConfig: b.generationConfig || {} });
   if (payload.length > 4000000) return fail(413, 'parse', 'Petición demasiado grande');
 
-  const tried = [], errs = [];
+  const t0 = Date.now(), BUDGET = 50000, tried = [], errs = [];
   const call = async (model) => {
+    const left = BUDGET - (Date.now() - t0);
+    if (left < 4000) return { retry: true, code: 'timeout' };
     tried.push(model);
-    let r;
+    let r, j;
+    const ac = new AbortController(), timer = setTimeout(() => ac.abort(), Math.min(left, 22000));
     try {
       r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: payload,
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: payload, signal: ac.signal,
       });
-    } catch (e) { return { fatal: { status: 502, code: 'net', message: 'No llego a Gemini' } }; }
-    const j = await r.json().catch(() => ({}));
+      j = await r.json().catch(() => ({}));
+    } catch (e) {
+      clearTimeout(timer);
+      if (e && e.name === 'AbortError') { errs.push(model + ' → sin respuesta en ' + Math.round(Math.min(left, 22000) / 1000) + ' s'); return { retry: true, code: 'timeout' }; }
+      return { fatal: { status: 502, code: 'net', message: 'No llego a Gemini' } };
+    }
+    clearTimeout(timer);
     if (r.ok) return { ok: j };
     const msg = (j.error && j.error.message) || 'HTTP ' + r.status;
     const code = r.status === 429 ? 'quota' : (r.status === 401 || r.status === 403 || /api key/i.test(msg)) ? 'badkey' : (r.status === 404 || /not found|not supported/i.test(msg)) ? 'model' : r.status >= 500 ? 'overloaded' : 'upstream';
@@ -50,5 +58,6 @@ module.exports = async (req, res) => {
     for (const model of found) { const x = await call(model); if (!x.retry) return finish(x); }
   } catch (e) { /* se informa abajo */ }
   if (errs.length && errs.every((e) => / → 429 /.test(e))) return fail(429, 'quota', errs.join(' | '));
+  if (errs.some((e) => /sin respuesta/.test(e)) || Date.now() - t0 > BUDGET - 4000) return fail(504, 'timeout', 'Gemini tardó demasiado. ' + errs.join(' | '));
   return fail(502, 'model', 'Ningún modelo respondió. ' + errs.join(' | '));
 };

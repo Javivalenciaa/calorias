@@ -747,6 +747,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (c === 'not_granted') return 'No has dado permiso a la app para usar Claude. Pulsa Analizar otra vez y acepta.';
     if (c === 'invalid_json' || c === 'empty_completion' || c === 'parse') return 'No he podido leer la respuesta. Pulsa Analizar otra vez.';
     if (c === 'image_rejected') return 'No he podido usar esa foto. Prueba con otra.';
+    if (c === 'timeout') return 'Gemini tardó demasiado en responder. Inténtalo otra vez (si es con foto, prueba con una más sencilla o añade una descripción).';
     if (c === 'overloaded') return 'Gemini está saturado ahora mismo. Inténtalo en un minuto. ' + ((e && e.message) || '');
     return 'Fallo al analizar: ' + ((e && e.message) || c || 'error') + '. Inténtalo de nuevo.';
   }
@@ -767,7 +768,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       res = await fetch('/api/gemini', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + tok }, body: JSON.stringify({ contents: [{ role: 'user', parts: parts }], generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } }) });
     } catch (e) { throw { code: 'net', message: String(e && e.message || e) }; }
     var j = null; try { j = await res.json(); } catch (e) {}
-    if (!res.ok || !j || j.error) { var er = (j && j.error) || {}; throw { code: er.code || (res.status === 401 ? 'auth' : res.status === 429 ? 'quota' : 'upstream'), message: er.message || ('HTTP ' + res.status) }; }
+    if (!res.ok || !j || j.error) { var er = (j && j.error) || {}; throw { code: er.code || (res.status === 401 ? 'auth' : res.status === 429 ? 'quota' : (res.status === 504 || res.status === 408) ? 'timeout' : 'upstream'), message: er.message || ('HTTP ' + res.status) }; }
     if (j.promptFeedback && j.promptFeedback.blockReason) throw { code: 'blocked', message: j.promptFeedback.blockReason };
     var c = j.candidates && j.candidates[0];
     var txt = c && c.content && c.content.parts ? c.content.parts.map(function (p) { return p.text || ''; }).join('') : '';
