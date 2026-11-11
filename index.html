@@ -341,6 +341,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var base, exercise, source;
     if (h && num(h.active) > 0) {
       var rest = num(h.resting) > 800 ? num(h.resting) : B;
+      if (h.at > 0 && h.at < 1380 && rest !== B) {                  // importado a mitad de día: proyectar el reposo a 24 h
+        rest = h.at >= 360 ? Math.min(Math.max(rest * 1440 / h.at, 0.9 * B), 1.15 * B) : B;
+      }
       base = rest + 0.10 * tot.k;                                   // + efecto térmico de la comida
       exercise = num(h.active) + (S.settings.healthHasWorkouts ? 0 : manual);
       source = 'salud';
@@ -1548,6 +1551,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function importHealth(txt) {
     var r = CC.parseHealth(txt, TODAY), day = dayOf(r.date, true);
     day.health = { steps: r.steps, active: r.active, resting: r.resting, workouts: r.workouts };
+    if (r.date === TODAY) { var nw = new Date(); day.health.at = nw.getHours() * 60 + nw.getMinutes(); }
     if (r.weight >= 30 && r.weight <= 300) addWeight(r.date, r.weight, false);
     touchDay(r.date);
     return '✓ Importado ' + dmy(r.date) + ': ' + fmt(r.steps) + ' pasos, ' + fmt(r.active) + ' kcal activas' + (r.weight ? ', peso ' + f1(r.weight) + ' kg' : '') + (r.workouts.length ? ', ' + r.workouts.length + ' entreno(s)' : '') + '.';
