@@ -747,7 +747,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (c === 'not_granted') return 'No has dado permiso a la app para usar Claude. Pulsa Analizar otra vez y acepta.';
     if (c === 'invalid_json' || c === 'empty_completion' || c === 'parse') return 'No he podido leer la respuesta. Pulsa Analizar otra vez.';
     if (c === 'image_rejected') return 'No he podido usar esa foto. Prueba con otra.';
-    return 'Fallo temporal al analizar (' + (c || (e && e.message) || 'error') + '). Inténtalo de nuevo.';
+    if (c === 'overloaded') return 'Gemini está saturado ahora mismo. Inténtalo en un minuto. ' + ((e && e.message) || '');
+    return 'Fallo al analizar: ' + ((e && e.message) || c || 'error') + '. Inténtalo de nuevo.';
   }
   function parseJsonLoose(t) {
     t = String(t || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
