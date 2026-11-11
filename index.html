@@ -532,7 +532,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     };
   }
   var S = defaultState();
-  var V = { tab: 'hoy', date: TODAY, weekStart: null, sheet: null, draft: null, work: null, wt: null, showTable: false, readout: '', hmsg: '', bmsg: '', aimsg: '', confirm: '', rdays: 14, rbusy: false, rmsg: '' };
+  var V = { tab: 'hoy', date: TODAY, weekStart: null, sheet: null, draft: null, work: null, wt: null, showTable: false, readout: '', hmsg: '', bmsg: '', confirm: '', rdays: 14, rbusy: false, rmsg: '' };
 
   /* ====================== Utilidades ====================== */
   function $(s, r) { return (r || document).querySelector(s); }
@@ -610,6 +610,14 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function touchDay(date) { touch(monthKey(date)); }
   /* --- Supabase (REST, sin SDK) --- */
   var SB = { cfg: lsGet('sb') || {}, msg: '' };
+  var CFG = { loaded: false, ok: false, ai: false };
+  async function loadConfig() {
+    var j = null;
+    try { var r = await fetch('/api/config', { cache: 'no-store' }); if (r.ok) j = await r.json(); } catch (e) {}
+    if (j && j.supabaseUrl) lsSet('cfg', j); else j = lsGet('cfg');
+    if (j && j.supabaseUrl && j.anonKey) { SB.cfg.url = j.supabaseUrl; SB.cfg.key = j.anonKey; CFG.ok = true; CFG.ai = !!j.ai; }
+    CFG.loaded = true;
+  }
   function sbSave() { lsSet('sb', SB.cfg); }
   function sbBase() { return String(SB.cfg.url || '').replace(/\/+$/, ''); }
   async function sbFetch(path, opt, auth) {
@@ -629,7 +637,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   async function sbToken() {
     var s = SB.cfg.session; if (!s) throw { code: 'auth', message: 'Inicia sesión' };
     if (Date.now() < s.exp) return s.at;
-    var j = await sbFetch('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: JSON.stringify({ refresh_token: s.rt }) });
+    var j;
+    try { j = await sbFetch('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: JSON.stringify({ refresh_token: s.rt }) }); }
+    catch (e) { if (e && e.code >= 400 && e.code < 500) { SB.cfg.session = null; sbSave(); Store.kind = null; setTimeout(render, 0); throw { code: 'auth' }; } throw e; }
     sbSession(j); return SB.cfg.session.at;
   }
   async function sbLogin(signup) {
@@ -700,7 +710,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   async function initRemote() {
     try {
       if (BUILD === 'web') {
-        if (SB.cfg.url && SB.cfg.key && SB.cfg.session) { Store.kind = 'supabase'; Store.uid = SB.cfg.session.uid; await syncNow(true); }
+        if (CFG.ok && SB.cfg.session) { Store.kind = 'supabase'; Store.uid = SB.cfg.session.uid; await syncNow(true); }
         return;
       }
       if (typeof claude === 'undefined') return;
@@ -714,9 +724,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
   /* ====================== IA ====================== */
   var AI = { claude: null, claudeImages: false, ready: false };
-  var GBASE = 'https://generativelanguage.googleapis.com/v1beta';
-  function aiCfg() { return lsGet('ai') || {}; }
-  function aiMode() { return BUILD === 'artifact' ? (AI.claude ? 'claude' : 'none') : (aiCfg().key ? 'gemini' : 'none'); }
+    function aiMode() { return BUILD === 'artifact' ? (AI.claude ? 'claude' : 'none') : (CFG.ai && SB.cfg.session ? 'gemini' : 'none'); }
   async function initAI() {
     try {
       if (BUILD === 'artifact' && typeof claude !== 'undefined') {
@@ -729,10 +737,11 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
   function aiErr(e) {
     var c = e && e.code;
-    if (c === 'nokey') return 'Falta la clave de Gemini. Añádela en Ajustes.';
-    if (c === 'badkey') return 'Gemini no acepta tu clave. Revísala en Ajustes.';
+    if (c === 'nokey') return 'La IA no está configurada en el servidor (falta GEMINI_API_KEY en Vercel).';
+    if (c === 'auth') return 'Tu sesión ha caducado. Vuelve a iniciar sesión.';
+    if (c === 'badkey') return 'Gemini rechaza la clave del servidor. Revisa GEMINI_API_KEY en Vercel.';
     if (c === 'quota' || c === 'rate_limited') return 'Has llegado al límite gratuito de la IA por ahora. Espera un minuto o añade la comida a mano.';
-    if (c === 'model') return 'Ese modelo no existe o no admite fotos. Cámbialo en Ajustes (botón «Probar»).';
+    if (c === 'model') return 'Ese modelo no existe o no admite fotos. Define GEMINI_MODEL en Vercel con un modelo válido.';
     if (c === 'net') return 'No hay conexión con Gemini. Comprueba tu internet.';
     if (c === 'blocked') return 'Gemini ha bloqueado esta petición. Prueba con otra foto o descríbela.';
     if (c === 'not_granted') return 'No has dado permiso a la app para usar Claude. Pulsa Analizar otra vez y acepta.';
@@ -747,25 +756,17 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (a >= 0 && b > a) { try { return JSON.parse(t.slice(a, b + 1)); } catch (e2) {} }
     throw { code: 'parse', message: 'JSON no válido' };
   }
-  async function geminiCall(path, body, key) {
-    var res;
-    try {
-      res = await fetch(GBASE + path, { method: body ? 'POST' : 'GET', headers: Object.assign({ 'x-goog-api-key': key }, body ? { 'Content-Type': 'application/json' } : {}), body: body ? JSON.stringify(body) : undefined });
-    } catch (e) { throw { code: 'net', message: String(e && e.message || e) }; }
-    var j = null; try { j = await res.json(); } catch (e) {}
-    if (!res.ok) {
-      var msg = (j && j.error && j.error.message) || ('HTTP ' + res.status);
-      var code = res.status === 429 ? 'quota' : (res.status === 401 || res.status === 403 || /api key/i.test(msg)) ? 'badkey' : res.status === 404 ? 'model' : res.status === 400 ? (/api key/i.test(msg) ? 'badkey' : /not found|not supported|invalid.*model/i.test(msg) ? 'model' : 'upstream') : 'upstream';
-      throw { code: code, message: msg };
-    }
-    return j;
-  }
   async function geminiJson(prompt, photo) {
-    var cfg = aiCfg(); if (!cfg.key) throw { code: 'nokey' };
-    var model = cfg.model || 'gemini-flash-latest';
+    if (!CFG.ai) throw { code: 'nokey' };
+    var tok = await sbToken();
     var parts = [{ text: prompt }];
     if (photo && photo.b64) parts.push({ inline_data: { mime_type: 'image/jpeg', data: photo.b64 } });
-    var j = await geminiCall('/models/' + encodeURIComponent(model) + ':generateContent', { contents: [{ role: 'user', parts: parts }], generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } }, cfg.key);
+    var res;
+    try {
+      res = await fetch('/api/gemini', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + tok }, body: JSON.stringify({ contents: [{ role: 'user', parts: parts }], generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } }) });
+    } catch (e) { throw { code: 'net', message: String(e && e.message || e) }; }
+    var j = null; try { j = await res.json(); } catch (e) {}
+    if (!res.ok || !j || j.error) { var er = (j && j.error) || {}; throw { code: er.code || (res.status === 401 ? 'auth' : res.status === 429 ? 'quota' : 'upstream'), message: er.message || ('HTTP ' + res.status) }; }
     if (j.promptFeedback && j.promptFeedback.blockReason) throw { code: 'blocked', message: j.promptFeedback.blockReason };
     var c = j.candidates && j.candidates[0];
     var txt = c && c.content && c.content.parts ? c.content.parts.map(function (p) { return p.text || ''; }).join('') : '';
@@ -781,26 +782,6 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       return AI.claude.json(prompt, o);
     }
     throw { code: 'nokey' };
-  }
-  function bestModel(models) {
-    if (models.indexOf('gemini-flash-latest') >= 0) return 'gemini-flash-latest';
-    var fl = models.filter(function (m) { return /flash/.test(m) && !/lite|preview|exp|thinking/.test(m); }).sort().reverse();
-    return fl[0] || models[0] || 'gemini-flash-latest';
-  }
-  async function aiTest() {
-    var key = (($('#ai-key') || {}).value || '').trim() || aiCfg().key || '';
-    var model = (($('#ai-model') || {}).value || '').trim();
-    if (!key) { V.aimsg = 'Pega primero tu clave API.'; setMsg('aimsg', V.aimsg, false); return; }
-    V.aimsg = 'Probando…'; setMsg('aimsg', V.aimsg, null);
-    try {
-      var j = await geminiCall('/models?pageSize=200', null, key);
-      var models = (j.models || []).filter(function (m) { return (m.supportedGenerationMethods || []).indexOf('generateContent') >= 0 && /gemini/.test(m.name) && !/embed|tts|image|audio|live|robotics|computer/.test(m.name); }).map(function (m) { return m.name.replace('models/', ''); });
-      if (!model || (models.length && models.indexOf(model) < 0 && !/latest$/.test(model))) model = bestModel(models);
-      lsSet('ai', { key: key, model: model, models: models });
-      V.aimsg = '✓ Conexión correcta. Modelo: ' + model + ' (' + models.length + ' disponibles).';
-    } catch (e) { V.aimsg = aiErr(e) + (e && e.message ? ' [' + String(e.message).slice(0, 120) + ']' : ''); }
-    if (V.tab === 'ajustes' && !V.sheet) { var k = $('#ai-key'), m = $('#ai-model'); var kv = k && k.value, mv = m && m.value; render(); }
-    else setMsg('aimsg', V.aimsg, V.aimsg.indexOf('✓') === 0);
   }
   function setMsg(id, text, ok) { var el = $('#' + id); if (!el) return; el.textContent = text; el.className = 'small ' + (ok === true ? 'good' : ok === false ? 'bad' : 'ink2'); }
 
@@ -836,7 +817,6 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
 
   /* Informe con IA a partir de todo el historial */
-  var SQL_SB = "-- Mis calor\u00edas \u00b7 esquema (ejecutar una vez en SQL Editor)\ncreate table if not exists public.calorias_docs (\n  user_id    uuid        not null default auth.uid() references auth.users(id) on delete cascade,\n  key        text        not null,\n  doc        jsonb       not null,\n  u          bigint      not null default 0,\n  updated_at timestamptz not null default now(),\n  primary key (user_id, key),\n  constraint calorias_docs_key_chk check (key ~ '^(core|m-[0-9]{4}-[0-9]{2})$'),\n  constraint calorias_docs_size_chk check (pg_column_size(doc) < 1048576)\n);\ncomment on table public.calorias_docs is 'core = perfil, pesos, favoritos y memoria de la IA; m-AAAA-MM = comidas y entrenos del mes';\n\ncreate or replace function public.calorias_touch() returns trigger\nlanguage plpgsql set search_path = '' as $$\nbegin new.updated_at := now(); return new; end $$;\ndrop trigger if exists calorias_touch on public.calorias_docs;\ncreate trigger calorias_touch before update on public.calorias_docs\n  for each row execute function public.calorias_touch();\n\nalter table public.calorias_docs enable row level security;\nrevoke all on public.calorias_docs from anon, public;\ngrant select, insert, update, delete on public.calorias_docs to authenticated;\ndrop policy if exists \"mis datos\" on public.calorias_docs;\ndrop policy if exists calorias_select on public.calorias_docs;\ndrop policy if exists calorias_insert on public.calorias_docs;\ndrop policy if exists calorias_update on public.calorias_docs;\ndrop policy if exists calorias_delete on public.calorias_docs;\ncreate policy calorias_select on public.calorias_docs for select to authenticated using ((select auth.uid()) = user_id);\ncreate policy calorias_insert on public.calorias_docs for insert to authenticated with check ((select auth.uid()) = user_id);\ncreate policy calorias_update on public.calorias_docs for update to authenticated using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);\ncreate policy calorias_delete on public.calorias_docs for delete to authenticated using ((select auth.uid()) = user_id);";
   function reportData(n) {
     var ctx = ctxNow(), T = CC.targets(S, ctx, TODAY), P = S.profile, days = [];
     for (var i = n; i >= 1; i--) {
@@ -851,7 +831,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
   async function makeReport() {
     if (V.rbusy) return;
-    if (aiMode() === 'none') { V.rmsg = 'Primero añade tu clave de Gemini en Ajustes → Inteligencia artificial.'; render(); return; }
+    if (aiMode() === 'none') { V.rmsg = 'La IA no está disponible (¿sesión iniciada y GEMINI_API_KEY en Vercel?).'; render(); return; }
     V.rbusy = true; V.rmsg = ''; render();
     try {
       var data = reportData(V.rdays);
@@ -1015,6 +995,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
   function render() {
     var app = $('#app'), html = '';
+    if (BUILD === 'web' && (!CFG.loaded || (CFG.ok && !SB.cfg.session))) {
+      app.innerHTML = CFG.loaded ? loginView() : '<div class="muted" style="text-align:center;padding:30vh 0">Cargando…</div>'; $('#tabs').innerHTML = ''; var sh = $('#sheet'); if (sh) { sh.className = ''; sh.innerHTML = ''; } return;
+    }
     if (V.tab === 'hoy') html = viewHoy();
     else if (V.tab === 'semana') html = viewSemana();
     else if (V.tab === 'progreso') html = viewProgreso();
@@ -1045,7 +1028,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var ctx = ctxNow(), di = CC.dayInfo(S, V.date, ctx), T = CC.targets(S, ctx, TODAY), day = dayOf(V.date) || { meals: [], workouts: [] };
     var h = topBar(ctx);
     if (!S.profile.done) h += '<div class="banner"><b>Empieza aquí:</b> rellena tu perfil (edad, altura, peso y objetivo) para que los cálculos sean precisos.<br><button class="sm primary" data-act="tab" data-t="ajustes" style="margin-top:8px">Ir a mi perfil</button></div>';
-    else if (aiMode() === 'none' && AI.ready !== false && BUILD === 'web') h += '<div class="banner"><b>Conecta Gemini</b> para que la IA calcule calorías desde fotos. Es gratis con tu clave de Google AI Studio.<br><button class="sm" data-act="tab" data-t="ajustes" style="margin-top:8px">Añadir clave</button></div>';
+    else if (aiMode() === 'none' && AI.ready !== false && BUILD === 'web') h += '<div class="banner"><b>IA no disponible.</b> ' + (CFG.ok ? 'Falta GEMINI_API_KEY en Vercel.' : 'Esta app necesita el servidor de Vercel con sus variables de entorno.') + ' Mientras tanto puedes añadir comidas a mano.</div>';
 
     var remaining = T.kcal - di.intake, over = remaining < 0;
     h += '<div class="card hero"><div class="ringwrap">' + ringSvg(di.intake / T.kcal, over) + '<div class="ringc"><b>' + fmt(Math.abs(remaining)) + '</b><span>' + (over ? 'kcal de más' : 'kcal restantes') + '</span></div></div>' +
@@ -1158,7 +1141,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (d.photo) h += '<div class="pvwrap"><img class="preview" src="' + d.photo.url + '" alt="Foto de la comida"><button data-act="rmphoto" aria-label="Quitar foto">✕</button></div>';
     else h += '<button class="photobox" data-act="pickphoto"' + (BUILD === 'artifact' && AI.ready && !AI.claudeImages ? ' disabled' : '') + '><span class="e">📷</span><b>Hacer foto o elegir de la galería</b><span class="small">La IA detecta los alimentos y calcula calorías</span></button>';
     h += '<div class="field" style="margin-top:12px"><label>Descripción (opcional, mejora mucho la precisión)</label><textarea data-bind="desc" placeholder="Ej: 200 g de arroz cocido, pechuga a la plancha (150 g), 1 cucharada de aceite de oliva, ensalada sin aliñar">' + esc(d.desc) + '</textarea></div>';
-    if (mode === 'none') h += '<div class="banner">' + (BUILD === 'web' ? 'Para analizar fotos con IA, añade tu clave de Gemini en Ajustes. Mientras tanto puedes añadir alimentos a mano o usar favoritos.<br><button class="sm" data-act="gosettings" style="margin-top:8px">Ir a Ajustes</button>' : 'El análisis con IA no está disponible aquí. Puedes añadir alimentos a mano o usar favoritos.') + '</div>';
+    if (mode === 'none') h += '<div class="banner">' + (BUILD === 'web' ? 'La IA no está disponible ahora mismo (revisa la configuración del servidor). Puedes añadir alimentos a mano o usar favoritos.' : 'El análisis con IA no está disponible aquí. Puedes añadir alimentos a mano o usar favoritos.') + '</div>';
     h += '<button class="primary full" data-act="analyze"' + (d.busy || mode === 'none' ? ' disabled' : '') + '>' + (d.busy ? '<span class="spin"></span>Analizando…' : '✨ Analizar con IA') + '</button>';
     if (d.err) h += '<p class="bad small" role="alert" style="margin:8px 0 0">' + esc(d.err) + '</p>';
     h += '<details><summary>Consejos para más precisión</summary><ol><li>Pon un cubierto o tu mano al lado para dar escala.</li><li>Di qué aceite o salsa llevaba y cuánto (1 cucharada ≈ 10 g).</li><li>Indica gramos si los pesaste, y si son en crudo o cocinado.</li><li>Para productos envasados usa «Añadir a mano» con la etiqueta (por 100 g).</li></ol></details></div>';
@@ -1301,22 +1284,19 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
   /* ====================== AJUSTES ====================== */
   function viewAjustes() {
-    var P = S.profile, ctx = ctxNow(), cfg = aiCfg();
+    var P = S.profile, ctx = ctxNow();
     var h = '<div class="top"><div class="toprow"><div class="datebox"><h1>Ajustes</h1><div class="dsub">Perfil, IA, Salud y copias</div></div></div></div>';
     if (!P.done) h += '<div class="banner"><b>Paso 1:</b> revisa tus datos y pulsa «Guardar perfil». Con eso ya puedes empezar a registrar.</div>';
 
-    h += '<div class="card"><h2>Inteligencia artificial</h2>';
     if (BUILD === 'web') {
-      h += '<p class="small ink2" style="margin-top:0">La IA es <b>Gemini de Google</b>. Crea tu clave gratis en <b>aistudio.google.com/apikey</b> y pégala aquí. Se guarda solo en este dispositivo.</p>' +
-        '<div class="field"><label>Clave API de Gemini</label><input id="ai-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" value="' + esc(cfg.key || '') + '" placeholder="AIza…"></div>' +
-        '<div class="field"><label>Modelo</label><input id="ai-model" list="ai-models" autocapitalize="off" spellcheck="false" value="' + esc(cfg.model || 'gemini-flash-latest') + '"><datalist id="ai-models">' + (cfg.models || []).map(function (m) { return '<option value="' + esc(m) + '">'; }).join('') + '</datalist></div>' +
-        '<div class="row"><button class="primary grow" data-act="aitest">Guardar y probar</button>' + (cfg.key ? '<button class="ghost danger" data-act="aiclear">Quitar clave</button>' : '') + '</div>' +
-        '<div class="small ' + (V.aimsg.indexOf('✓') === 0 ? 'good' : 'ink2') + '" id="aimsg" style="margin-top:8px">' + esc(V.aimsg || (cfg.key ? 'Clave guardada.' : 'Sin clave todavía.')) + '</div>' +
-        '<div class="tiny muted" style="margin-top:8px">El plan gratuito tiene límites de uso por minuto y por día. Google puede usar lo que envías (fotos y textos) para mejorar sus productos en el plan gratuito: no subas nada que no quieras compartir.</div>';
+      var on = Store.kind === 'supabase' && SB.cfg.session;
+      h += '<div class="card"><h2>Cuenta y nube</h2>';
+      if (on) h += '<p class="small ink2" style="margin-top:0">Sesión iniciada como <b>' + esc(SB.cfg.email || '') + '</b>. Tus datos se guardan en tu base de datos y la IA usa tu historial.</p><div class="row"><button class="primary grow" data-act="sbsync">Sincronizar ahora</button><button class="ghost danger" data-act="sbout">Cerrar sesión</button></div>';
+      else h += '<p class="small ink2" style="margin:0">' + (CFG.ok ? 'Sin sesión.' : 'Servidor no configurado: los datos se guardan solo en este dispositivo y la IA no funciona. Define SUPABASE_URL, SUPABASE_ANON_KEY y GEMINI_API_KEY en Vercel.') + '</p>';
+      h += '<div class="small ink2" id="sbmsg" style="margin-top:8px">' + esc(SB.msg) + '</div></div>';
     } else {
-      h += '<p class="small ink2" style="margin:0">Las fotos las analiza <b>Claude</b> con tu propia cuenta. ' + (AI.claude ? '<span class="good">Disponible.</span>' : AI.ready ? '<span class="bad">No disponible en esta vista.</span>' : 'Comprobando…') + '</p>';
+      h += '<div class="card"><h2>Inteligencia artificial</h2><p class="small ink2" style="margin:0">Las fotos las analiza <b>Claude</b> con tu propia cuenta. ' + (AI.claude ? '<span class="good">Disponible.</span>' : AI.ready ? '<span class="bad">No disponible en esta vista.</span>' : 'Comprobando…') + '</p></div>';
     }
-    h += '</div>';
 
     h += '<div class="card"><h2>Tu perfil</h2>';
     h += '<div class="grid3"><div class="field"><label>Sexo</label><select id="pf-sex"><option value="m"' + (P.sex === 'm' ? ' selected' : '') + '>Hombre</option><option value="f"' + (P.sex === 'f' ? ' selected' : '') + '>Mujer</option></select></div>' +
@@ -1349,26 +1329,6 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
     if (BUILD === 'web') h += '<div class="card"><h2>Instalar en el móvil</h2><ol class="small ink2" style="padding-left:20px;margin:0"><li>Abre esta web en <b>Safari</b> (iPhone) o Chrome (Android).</li><li>iPhone: botón <b>Compartir</b> → <b>Añadir a pantalla de inicio</b>. Android: menú ⋮ → <b>Instalar app</b>.</li><li>Ábrela desde el icono: funciona a pantalla completa, como una app.</li></ol></div>';
 
-    if (BUILD === 'web') {
-      var c = SB.cfg, on = Store.kind === 'supabase' && c.session;
-      h += '<div class="card"><h2>Sincronización (Supabase)</h2>';
-      if (on) {
-        h += '<p class="small ink2" style="margin-top:0">Conectado como <b>' + esc(c.email || '') + '</b>. Tus comidas, entrenos y pesajes de cada día se guardan en tu base de datos y la IA los usa en los informes.</p>' +
-          '<div class="row"><button class="primary grow" data-act="sbsync">Sincronizar ahora</button><button class="ghost danger" data-act="sbout">Desconectar</button></div>';
-      } else {
-        h += '<p class="small ink2" style="margin-top:0">Opcional y gratis. Guarda tus datos en la nube para no perderlos y verlos en varios dispositivos. Sin esto, todo queda solo en este móvil.</p>' +
-          '<ol class="small ink2" style="padding-left:20px;margin:0 0 8px"><li>Crea un proyecto en <b>supabase.com</b> y abre <b>SQL Editor</b>.</li><li>Pega y ejecuta este SQL (botón de copiar):</li></ol>' +
-          '<pre class="tiny" style="white-space:pre-wrap;user-select:all">' + esc(SQL_SB) + '</pre><button class="sm ghost" data-act="sbsql">Copiar SQL</button>' +
-          '<ol start="3" class="small ink2" style="padding-left:20px;margin:8px 0"><li>En <b>Authentication → Providers → Email</b> desactiva «Confirm email».</li><li>En <b>Project Settings → API</b> copia la <b>Project URL</b> y la clave <b>anon / publishable</b>.</li></ol>' +
-          '<div class="field"><label>Project URL</label><input id="sb-url" autocapitalize="off" spellcheck="false" placeholder="https://xxxx.supabase.co" value="' + esc(c.url || '') + '"></div>' +
-          '<div class="field"><label>Clave anon / publishable</label><input id="sb-key" type="password" autocapitalize="off" spellcheck="false" value="' + esc(c.key || '') + '"></div>' +
-          '<div class="field"><label>Email</label><input id="sb-email" type="email" autocapitalize="off" value="' + esc(c.email || '') + '"></div>' +
-          '<div class="field"><label>Contraseña (mín. 6)</label><input id="sb-pw" type="password" autocomplete="off"></div>' +
-          '<div class="row"><button class="primary grow" data-act="sblogin">Iniciar sesión</button><button class="grow" data-act="sbsignup">Crear cuenta</button></div>';
-      }
-      h += '<div class="small ' + (SB.msg.indexOf('✓') === 0 ? 'good' : 'ink2') + '" id="sbmsg" style="margin-top:8px">' + esc(SB.msg) + '</div></div>';
-    }
-
     h += '<div class="card"><h2>Copia de seguridad</h2><div class="row"><button class="grow" data-act="export">Generar copia</button><button class="grow" data-act="importbk">Restaurar</button></div>' +
       '<textarea id="bk" style="margin-top:8px" placeholder="Aquí aparece la copia (cópiala) o pega una para restaurar"></textarea><div class="small ' + (V.bmsg.indexOf('✓') === 0 ? 'good' : 'ink2') + '" id="bmsg" style="margin-top:4px">' + esc(V.bmsg) + '</div>' +
       '<div class="tiny muted" id="syncst" style="margin-top:8px">' + esc(Store.status) + '</div>' +
@@ -1377,17 +1337,22 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
 
   async function sbConnect(signup) {
-    var url = ($('#sb-url').value || '').trim(), key = ($('#sb-key').value || '').trim(), em = ($('#sb-email').value || '').trim(), pw = $('#sb-pw').value || '';
-    if (!/^https?:\/\//.test(url)) { SB.msg = 'La URL debe empezar por https://'; render(); return; }
-    if (!key || !em || pw.length < 6) { SB.msg = 'Rellena clave, email y contraseña (mín. 6).'; render(); return; }
-    SB.cfg.url = url; SB.cfg.key = key; SB.cfg.email = em; SB.pw = pw; SB.msg = 'Conectando…'; render();
+    var em = ($('#lg-email').value || '').trim(), pw = $('#lg-pw').value || '';
+    if (!em || pw.length < 6) { SB.msg = 'Escribe tu email y una contraseña de al menos 6 caracteres.'; render(); return; }
+    SB.cfg.email = em; SB.pw = pw; SB.msg = 'Entrando…'; render();
     try {
       await sbLogin(signup); SB.pw = '';
       Store.kind = 'supabase'; Store.uid = SB.cfg.session.uid; SB.msg = '';
-      await syncNow();
-      SB.msg = Store.status.indexOf('Sin sincronizar') === 0 ? Store.status : '✓ Conectado. ' + Store.status;
+      await syncNow(true);
     } catch (e) { SB.pw = ''; SB.msg = sbErr(e); }
     render();
+  }
+  function loginView() {
+    return '<div style="padding:calc(40px + env(safe-area-inset-top)) 6px 24px"><div style="text-align:center;margin-bottom:22px"><img src="icon-192.png" width="84" height="84" alt="" style="border-radius:20px"><h1 style="margin:12px 0 2px">Mis calorías</h1><div class="small ink2">Inicia sesión para ver y guardar tus datos</div></div>' +
+      '<div class="card"><div class="field"><label>Email</label><input id="lg-email" type="email" autocomplete="username" autocapitalize="off" value="' + esc(SB.cfg.email || '') + '"></div>' +
+      '<div class="field"><label>Contraseña</label><input id="lg-pw" type="password" autocomplete="current-password"></div>' +
+      '<button class="primary full" data-act="sblogin">Iniciar sesión</button><button class="full" style="margin-top:8px" data-act="sbsignup">Crear cuenta</button>' +
+      '<div class="small ' + (/^Entrando/.test(SB.msg) ? 'ink2' : 'bad') + '" id="sbmsg" style="margin-top:10px">' + esc(SB.msg) + '</div></div></div>';
   }
 
   /* ====================== Acciones ====================== */
@@ -1491,13 +1456,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     rdays: function (t) { V.rdays = +t.dataset.n; render(); },
     report: function () { makeReport(); },
     clearmem: function () { S.memory = { notes: [] }; touchCore(); render(); },
-    sbsql: function () { try { navigator.clipboard.writeText(SQL_SB); toast('SQL copiado'); } catch (e) { toast('Mantén pulsado el SQL para copiarlo'); } },
     sblogin: function () { sbConnect(false); },
     sbsignup: function () { sbConnect(true); },
     sbsync: async function () { SB.msg = 'Sincronizando…'; render(); await syncNow(); SB.msg = Store.status.indexOf('Sin sincronizar') === 0 ? Store.status : '✓ ' + Store.status; render(); },
-    sbout: function () { SB.cfg.session = null; sbSave(); Store.kind = null; Store.uid = null; Store.pending = {}; SB.msg = 'Desconectado. Tus datos siguen en este dispositivo.'; Store.status = 'Guardado en este dispositivo'; render(); },
-    aitest: function () { aiTest(); },
-    aiclear: function () { lsDel('ai'); V.aimsg = 'Clave eliminada de este dispositivo.'; render(); },
+    sbout: function () { SB.cfg.session = null; sbSave(); Store.kind = null; Store.uid = null; Store.pending = {}; SB.msg = ''; Store.status = 'Guardado en este dispositivo'; render(); },
     saveprofile: function () {
       var P = S.profile, age = readNum('pf-age', 0), height = readNum('pf-height', 0), weight = readNum('pf-weight', 0);
       if (age < 14 || age > 90 || height < 120 || height > 230 || weight < 30 || weight > 300) { toast('Revisa edad, altura y peso'); return; }
@@ -1594,9 +1556,12 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   /* ====================== Arranque ====================== */
   loadLocal();
   if (!S.profile.done && !S.weights.length) V.tab = 'ajustes';
-  render();
-  initAI();
-  initRemote();
+  (async function () {
+    if (BUILD === 'web') { render(); await loadConfig(); }
+    render();
+    initAI();
+    initRemote();
+  })();
   try { if (BUILD === 'web' && navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   if (BUILD === 'web' && 'serviceWorker' in navigator && /^https?:$/.test(location.protocol)) { try { navigator.serviceWorker.register('sw.js'); } catch (e) {} }
   // Si la app queda abierta de un día para otro, vuelve a "hoy" al reabrirla
