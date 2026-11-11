@@ -4,6 +4,6 @@ module.exports = (req, res) => {
   res.status(200).json({
     supabaseUrl: process.env.SUPABASE_URL || '',
     anonKey: process.env.SUPABASE_ANON_KEY || '',
-    ai: !!process.env.GEMINI_API_KEY,
+    ai: !!require('./_providers').pick(),
   });
 };

@@ -737,18 +737,18 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
   function aiErr(e) {
     var c = e && e.code;
-    if (c === 'nokey') return 'La IA no está configurada en el servidor (falta GEMINI_API_KEY en Vercel).';
+    if (c === 'nokey') return 'Falta la clave de IA en Vercel (GROQ_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY u OPENAI_API_KEY).';
     if (c === 'auth') return 'Tu sesión ha caducado. Vuelve a iniciar sesión.';
-    if (c === 'badkey') return 'Gemini rechaza la clave del servidor. Revisa GEMINI_API_KEY en Vercel.';
+    if (c === 'badkey') return 'El proveedor de IA rechaza la clave del servidor. Revísala en Vercel. ' + ((e && e.message) || '');
     if (c === 'quota' || c === 'rate_limited') return 'Has llegado al límite gratuito de la IA por ahora. Espera un minuto o añade la comida a mano.';
-    if (c === 'model') return 'Ese modelo no existe o no admite fotos. Define GEMINI_MODEL en Vercel con un modelo válido.';
-    if (c === 'net') return 'No hay conexión con Gemini. Comprueba tu internet.';
-    if (c === 'blocked') return 'Gemini ha bloqueado esta petición. Prueba con otra foto o descríbela.';
+    if (c === 'model') return 'El modelo de IA no está disponible: ' + ((e && e.message) || '');
+    if (c === 'net') return 'No hay conexión con la IA. Comprueba tu internet.';
+    if (c === 'blocked') return 'La IA ha bloqueado esta petición. Prueba con otra foto o descríbela.';
     if (c === 'not_granted') return 'No has dado permiso a la app para usar Claude. Pulsa Analizar otra vez y acepta.';
     if (c === 'invalid_json' || c === 'empty_completion' || c === 'parse') return 'No he podido leer la respuesta. Pulsa Analizar otra vez.';
     if (c === 'image_rejected') return 'No he podido usar esa foto. Prueba con otra.';
-    if (c === 'timeout') return 'Gemini tardó demasiado en responder. Inténtalo otra vez (si es con foto, prueba con una más sencilla o añade una descripción).';
-    if (c === 'overloaded') return 'Gemini está saturado ahora mismo. Inténtalo en un minuto. ' + ((e && e.message) || '');
+    if (c === 'timeout') return 'La IA tardó demasiado en responder. Inténtalo otra vez (si es con foto, prueba con una más sencilla o añade una descripción).';
+    if (c === 'overloaded') return 'La IA está saturada ahora mismo. Inténtalo en un minuto. ' + ((e && e.message) || '');
     return 'Fallo al analizar: ' + ((e && e.message) || c || 'error') + '. Inténtalo de nuevo.';
   }
   function parseJsonLoose(t) {
@@ -761,19 +761,14 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   async function geminiJson(prompt, photo) {
     if (!CFG.ai) throw { code: 'nokey' };
     var tok = await sbToken();
-    var parts = [{ text: prompt }];
-    if (photo && photo.b64) parts.push({ inline_data: { mime_type: 'image/jpeg', data: photo.b64 } });
     var res;
     try {
-      res = await fetch('/api/gemini', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + tok }, body: JSON.stringify({ contents: [{ role: 'user', parts: parts }], generationConfig: { temperature: 0.2, responseMimeType: 'application/json' } }) });
+      res = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + tok }, body: JSON.stringify({ prompt: prompt, image: photo && photo.b64 ? photo.b64 : null }) });
     } catch (e) { throw { code: 'net', message: String(e && e.message || e) }; }
     var j = null; try { j = await res.json(); } catch (e) {}
     if (!res.ok || !j || j.error) { var er = (j && j.error) || {}; throw { code: er.code || (res.status === 401 ? 'auth' : res.status === 429 ? 'quota' : (res.status === 504 || res.status === 408) ? 'timeout' : 'upstream'), message: er.message || ('HTTP ' + res.status) }; }
-    if (j.promptFeedback && j.promptFeedback.blockReason) throw { code: 'blocked', message: j.promptFeedback.blockReason };
-    var c = j.candidates && j.candidates[0];
-    var txt = c && c.content && c.content.parts ? c.content.parts.map(function (p) { return p.text || ''; }).join('') : '';
-    if (!txt) throw { code: 'empty_completion', message: 'respuesta vacía' };
-    return parseJsonLoose(txt);
+    if (!j.text) throw { code: 'empty_completion', message: 'respuesta vacía' };
+    return parseJsonLoose(j.text);
   }
   async function aiJson(prompt, photo) {
     var m = aiMode();
@@ -833,7 +828,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
   async function makeReport() {
     if (V.rbusy) return;
-    if (aiMode() === 'none') { V.rmsg = 'La IA no está disponible (¿sesión iniciada y GEMINI_API_KEY en Vercel?).'; render(); return; }
+    if (aiMode() === 'none') { V.rmsg = 'La IA no está disponible (¿sesión iniciada y clave de IA en Vercel?).'; render(); return; }
     V.rbusy = true; V.rmsg = ''; render();
     try {
       var data = reportData(V.rdays);
@@ -1030,7 +1025,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var ctx = ctxNow(), di = CC.dayInfo(S, V.date, ctx), T = CC.targets(S, ctx, TODAY), day = dayOf(V.date) || { meals: [], workouts: [] };
     var h = topBar(ctx);
     if (!S.profile.done) h += '<div class="banner"><b>Empieza aquí:</b> rellena tu perfil (edad, altura, peso y objetivo) para que los cálculos sean precisos.<br><button class="sm primary" data-act="tab" data-t="ajustes" style="margin-top:8px">Ir a mi perfil</button></div>';
-    else if (aiMode() === 'none' && AI.ready !== false && BUILD === 'web') h += '<div class="banner"><b>IA no disponible.</b> ' + (CFG.ok ? 'Falta GEMINI_API_KEY en Vercel.' : 'Esta app necesita el servidor de Vercel con sus variables de entorno.') + ' Mientras tanto puedes añadir comidas a mano.</div>';
+    else if (aiMode() === 'none' && AI.ready !== false && BUILD === 'web') h += '<div class="banner"><b>IA no disponible.</b> ' + (CFG.ok ? 'Falta una clave de IA en Vercel.' : 'Esta app necesita el servidor de Vercel con sus variables de entorno.') + ' Mientras tanto puedes añadir comidas a mano.</div>';
 
     var remaining = T.kcal - di.intake, over = remaining < 0;
     h += '<div class="card hero"><div class="ringwrap">' + ringSvg(di.intake / T.kcal, over) + '<div class="ringc"><b>' + fmt(Math.abs(remaining)) + '</b><span>' + (over ? 'kcal de más' : 'kcal restantes') + '</span></div></div>' +
@@ -1294,7 +1289,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       var on = Store.kind === 'supabase' && SB.cfg.session;
       h += '<div class="card"><h2>Cuenta y nube</h2>';
       if (on) h += '<p class="small ink2" style="margin-top:0">Sesión iniciada como <b>' + esc(SB.cfg.email || '') + '</b>. Tus datos se guardan en tu base de datos y la IA usa tu historial.</p><div class="row"><button class="primary grow" data-act="sbsync">Sincronizar ahora</button><button class="ghost danger" data-act="sbout">Cerrar sesión</button></div>';
-      else h += '<p class="small ink2" style="margin:0">' + (CFG.ok ? 'Sin sesión.' : 'Servidor no configurado: los datos se guardan solo en este dispositivo y la IA no funciona. Define SUPABASE_URL, SUPABASE_ANON_KEY y GEMINI_API_KEY en Vercel.') + '</p>';
+      else h += '<p class="small ink2" style="margin:0">' + (CFG.ok ? 'Sin sesión.' : 'Servidor no configurado: los datos se guardan solo en este dispositivo y la IA no funciona. Define las variables de entorno en Vercel.') + '</p>';
       h += '<div class="small ink2" id="sbmsg" style="margin-top:8px">' + esc(SB.msg) + '</div></div>';
     } else {
       h += '<div class="card"><h2>Inteligencia artificial</h2><p class="small ink2" style="margin:0">Las fotos las analiza <b>Claude</b> con tu propia cuenta. ' + (AI.claude ? '<span class="good">Disponible.</span>' : AI.ready ? '<span class="bad">No disponible en esta vista.</span>' : 'Comprobando…') + '</p></div>';
