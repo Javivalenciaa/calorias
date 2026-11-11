@@ -255,7 +255,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       var s = String(x).trim().replace(/(\d)[\s\u00a0\u202f](?=\d{3}\b)/g, '$1');   // 8 234 -> 8234
       var tok = s.match(/-?\d[\d.,]*/); s = tok ? tok[0] : s;                          // "412 kcal" -> 412
       if (/^\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) s = s.replace(/\./g, '');            // 8.234 -> 8234
-      else if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) s = s.replace(/,/g, '');          // 8,234 -> 8234
+      else if (/^\d{1,3}(,\d{3}){2,}(\.\d+)?$/.test(s)) s = s.replace(/,/g, '');        // 1,234,567 -> 1234567 (una sola coma = decimal español)
       n = parseFloat(s.replace(',', '.'));
     }
     return isFinite(n) ? n : (def === undefined ? 0 : def);
