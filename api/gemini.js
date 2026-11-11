@@ -30,8 +30,8 @@ module.exports = async (req, res) => {
     const msg = (j.error && j.error.message) || 'HTTP ' + r.status;
     const code = r.status === 429 ? 'quota' : (r.status === 401 || r.status === 403 || /api key/i.test(msg)) ? 'badkey' : (r.status === 404 || /not found|not supported/i.test(msg)) ? 'model' : r.status >= 500 ? 'overloaded' : 'upstream';
     errs.push(model + ' → ' + r.status + ' ' + msg.slice(0, 140));
-    // Solo se sigue probando si es un problema de este modelo (no existe, saturado, error 5xx o petición rechazada)
-    return ['model', 'overloaded', 'upstream'].includes(code) ? { retry: true, code } : { fatal: { status: r.status === 429 ? 429 : 502, code, message: msg } };
+    // Solo se sigue probando si es un problema de este modelo (no existe, saturado, sin cuota —la cuota gratuita es por modelo—, error 5xx o petición rechazada)
+    return ['model', 'overloaded', 'upstream', 'quota'].includes(code) ? { retry: true, code } : { fatal: { status: r.status === 429 ? 429 : 502, code, message: msg } };
   };
   const finish = (x) => (x.ok ? res.status(200).json(x.ok) : fail(x.fatal.status, x.fatal.code, x.fatal.message));
   for (const model of [...new Set(MODELS())]) {
@@ -49,5 +49,6 @@ module.exports = async (req, res) => {
       .sort().reverse().slice(0, 3);
     for (const model of found) { const x = await call(model); if (!x.retry) return finish(x); }
   } catch (e) { /* se informa abajo */ }
+  if (errs.length && errs.every((e) => / → 429 /.test(e))) return fail(429, 'quota', errs.join(' | '));
   return fail(502, 'model', 'Ningún modelo respondió. ' + errs.join(' | '));
 };
