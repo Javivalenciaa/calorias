@@ -1313,14 +1313,12 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     h += '<div class="card"><h2>Datos de Apple Salud (Atajo)</h2><p class="small ink2" style="margin-top:0">Ejecuta tu Atajo (copia tus datos de Salud al portapapeles) y pégalos aquí.</p>' +
       '<textarea id="hin" placeholder="fecha=2026-11-11&#10;pasos=8234&#10;activas=412&#10;reposo=1790&#10;peso=77,8&#10;entreno=Pesas;62;310"></textarea>' +
       '<button class="full" style="margin-top:8px" data-act="importhealth">Importar datos de Salud</button><div class="small ' + (V.hmsg.indexOf('✓') === 0 ? 'good' : 'bad') + '" style="margin-top:6px" id="hmsg">' + esc(V.hmsg) + '</div>' +
-      '<details><summary>Cómo crear el Atajo (5 min, una sola vez)</summary><ol>' +
-      '<li>Abre la app <b>Atajos</b> → <b>+</b> → nuevo atajo.</li>' +
-      '<li>Añade <b>Buscar muestras de Salud</b>: tipo <i>Pasos</i>, fecha de inicio <i>es hoy</i>. Luego <b>Calcular estadísticas</b> → <i>Suma</i>. Repite con <i>Energía activa</i> y <i>Energía en reposo</i> (suma), y con <i>Peso corporal</i> (último, ordenado por fecha, límite 1).</li>' +
-      '<li>Para los entrenos: <b>Buscar entrenamientos</b> de hoy; por cada uno, un texto <code>entreno=[Tipo];[Duración en min];[Energía]</code>.</li>' +
-      '<li>Añade un bloque <b>Texto</b> con estas líneas, poniendo cada variable mágica donde toca:<pre>fecha=[Fecha actual, formato personalizado yyyy-MM-dd]\npasos=[suma pasos]\nactivas=[suma energía activa]\nreposo=[suma energía reposo]\npeso=[último peso]\n[líneas de entreno]</pre></li>' +
-      '<li>Termina con <b>Copiar al portapapeles</b>. Ponle de nombre «Salud → Calorías» y añádelo a la pantalla de inicio.</li>' +
-      '<li>Cada noche: ejecútalo, abre esta app → Ajustes → pega → Importar.</li></ol>' +
-      '<p class="tiny muted">También acepto JSON. Si algún dato falta (p. ej. sin Apple Watch), se ignora. Puedes importar días anteriores cambiando la fecha.</p></details></div>';
+      '<details><summary>Cómo crear el Atajo (una sola vez)</summary><ol>' +
+      '<li>En <b>Atajos</b>: <b>Buscar muestras médicas</b> (tipo <i>Steps</i>, fecha de inicio <i>es hoy</i>) → <b>Calcular estadísticas</b> (Suma) → <b>Definir variable</b> <code>pasos</code>.</li>' +
+      '<li>Lo mismo con <i>Active Energy</i> → variable <code>activas</code> y con <i>Resting Energy</i> → variable <code>reposo</code> (unidad kcal).</li>' +
+      '<li>Añade <b>Texto</b> con la dirección de esta web seguida de:<pre>/?fecha=[Fecha actual yyyy-MM-dd]&amp;pasos=[pasos]&amp;activas=[activas]&amp;reposo=[reposo]</pre></li>' +
+      '<li>Termina con <b>Abrir URLs</b>. Al ejecutar el atajo, la app se abre sola y se importa el día (peso y entrenos los apuntas aquí).</li></ol>' +
+      '<p class="tiny muted">Alternativa: si prefieres copiar y pegar, acepto texto con líneas <code>pasos=…</code>, <code>activas=…</code>, <code>reposo=…</code> o JSON. Si falta algún dato se ignora.</p></details></div>';
 
     h += '<div class="card"><h2>Mis favoritos</h2>' + (S.favs.length ? S.favs.map(function (f) { return '<div class="kv"><span>' + esc(f.name) + ' <span class="muted">· ' + fmt(f.k) + ' kcal · P ' + fmt(f.p) + '</span></span><button class="sm ghost danger" data-act="delfav" data-id="' + f.id + '" aria-label="Borrar">✕</button></div>'; }).join('') : '<p class="muted small" style="margin:0">Marca «Guardar como favorito» al añadir una comida (por ejemplo tu batido de proteína).</p>') + '</div>';
 
@@ -1470,15 +1468,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       render(); toast('Perfil guardado');
     },
     importhealth: function () {
-      var txt = $('#hin').value;
-      try {
-        var r = CC.parseHealth(txt, TODAY), day = dayOf(r.date, true);
-        day.health = { steps: r.steps, active: r.active, resting: r.resting, workouts: r.workouts };
-        if (r.weight >= 30 && r.weight <= 300) addWeight(r.date, r.weight, false);
-        touchDay(r.date);
-        V.hmsg = '✓ Importado ' + dmy(r.date) + ': ' + fmt(r.steps) + ' pasos, ' + fmt(r.active) + ' kcal activas' + (r.weight ? ', peso ' + f1(r.weight) + ' kg' : '') + (r.workouts.length ? ', ' + r.workouts.length + ' entreno(s)' : '') + '.';
-        render();
-      } catch (e) { V.hmsg = 'No he podido leer esos datos: ' + (e.message || 'formato no válido'); var m = $('#hmsg'); if (m) { m.textContent = V.hmsg; m.className = 'small bad'; } }
+      try { V.hmsg = importHealth($('#hin').value); render(); }
+      catch (e) { V.hmsg = 'No he podido leer esos datos: ' + (e.message || 'formato no válido'); var m = $('#hmsg'); if (m) { m.textContent = V.hmsg; m.className = 'small bad'; } }
     },
     delfav: function (t) { S.favs = S.favs.filter(function (f) { return f.id !== t.dataset.id; }); touchCore(); render(); },
     export: function () {
@@ -1551,7 +1542,27 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }, { passive: true });
 
   /* ====================== Arranque ====================== */
+  function importHealth(txt) {
+    var r = CC.parseHealth(txt, TODAY), day = dayOf(r.date, true);
+    day.health = { steps: r.steps, active: r.active, resting: r.resting, workouts: r.workouts };
+    if (r.weight >= 30 && r.weight <= 300) addWeight(r.date, r.weight, false);
+    touchDay(r.date);
+    return '✓ Importado ' + dmy(r.date) + ': ' + fmt(r.steps) + ' pasos, ' + fmt(r.active) + ' kcal activas' + (r.weight ? ', peso ' + f1(r.weight) + ' kg' : '') + (r.workouts.length ? ', ' + r.workouts.length + ' entreno(s)' : '') + '.';
+  }
+  // El Atajo abre la app con los datos en la dirección: /?fecha=2026-11-11&pasos=8234&activas=412&reposo=1790
+  function importFromUrl() {
+    try {
+      var q = new URLSearchParams(location.search), keys = ['fecha', 'pasos', 'activas', 'reposo', 'peso'], lines = [];
+      keys.forEach(function (k) { if (q.get(k)) lines.push(k + '=' + q.get(k)); });
+      if (!lines.length) return;
+      var msg = importHealth(lines.join('\n'));
+      history.replaceState(null, '', location.pathname);
+      V.hmsg = msg; V.tab = 'hoy'; setTimeout(function () { toast(msg.replace('✓ ', '')); }, 300);
+    } catch (e) { V.hmsg = 'No he podido leer los datos del Atajo: ' + (e.message || ''); try { history.replaceState(null, '', location.pathname); } catch (x) {} }
+  }
+
   loadLocal();
+  if (BUILD === 'web') importFromUrl();
   if (!S.profile.done && !S.weights.length) V.tab = 'ajustes';
   (async function () {
     if (BUILD === 'web') { render(); await loadConfig(); }
