@@ -57,7 +57,7 @@ const PROVIDERS = {
       const call = async (model) => {
         tried.push(model);
         try {
-          const j = await post('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', { 'x-goog-api-key': env('GEMINI_API_KEY') }, body, Math.min(22000, 50000 - (Date.now() - t0)));
+          const j = await post('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', { 'x-goog-api-key': env('GEMINI_API_KEY') }, body, Math.min(20000, 55000 - (Date.now() - t0)));
           const c = j.candidates && j.candidates[0];
           return { text: c && c.content && c.content.parts ? c.content.parts.map((x) => x.text || '').join('') : '' };
         } catch (e) {
@@ -66,10 +66,20 @@ const PROVIDERS = {
           return { err: e };
         }
       };
-      for (const m of [...new Set([env('GEMINI_MODEL'), 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'].filter(Boolean))]) {
-        if (Date.now() - t0 > 46000) break;
+      const order = [...new Set([env('GEMINI_MODEL'), 'gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-flash-latest'].filter(Boolean))];
+      for (const m of order) {
+        if (Date.now() - t0 > 40000) break;
         const x = await call(m); if (!x.err) return x;
       }
+      // Los nombres de modelo cambian a menudo: se pregunta a Google cuáles tiene esta clave y se prueban los más nuevos.
+      try {
+        const lr = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': env('GEMINI_API_KEY') } });
+        const lj = await lr.json().catch(() => ({}));
+        const found = (lj.models || []).filter((m) => (m.supportedGenerationMethods || []).includes('generateContent')).map((m) => String(m.name || '').replace(/^models\//, ''))
+          .filter((n) => /^gemini-\d/.test(n) && /flash/.test(n) && !/embed|tts|image|audio|live|robotics|computer|exp|thinking/.test(n) && !tried.includes(n))
+          .sort((a, b) => (/lite/.test(a) - /lite/.test(b)) || (a < b ? 1 : -1)).slice(0, 2);
+        for (const m of found) { if (Date.now() - t0 > 40000) break; const x = await call(m); if (!x.err) return x; }
+      } catch (e) { /* se informa abajo */ }
       throw { status: 502, code: 'model', message: 'Gemini no respondió. ' + errs.join(' | ') };
     },
   },
