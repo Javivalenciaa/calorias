@@ -1314,7 +1314,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
     h += '<div class="card"><h2>Datos de Apple Salud (Atajo)</h2><p class="small ink2" style="margin-top:0">Ejecuta tu Atajo (copia tus datos de Salud al portapapeles) y pégalos aquí.</p>' +
       '<textarea id="hin" placeholder="fecha=2026-11-11&#10;pasos=8234&#10;activas=412&#10;reposo=1790&#10;peso=77,8&#10;entreno=Pesas;62;310"></textarea>' +
-      '<button class="full" style="margin-top:8px" data-act="importhealth">Importar datos de Salud</button><div class="small ' + (V.hmsg.indexOf('✓') === 0 ? 'good' : 'bad') + '" style="margin-top:6px" id="hmsg">' + esc(V.hmsg) + '</div>' +
+      '<button class="full" style="margin-top:8px" data-act="importhealth">Importar datos de Salud</button>' + (((S.days[V.date] || {}).health) ? '<button class="full ghost danger" style="margin-top:8px" data-act="delhealth">Quitar los datos de Salud del ' + dmy(V.date) + '</button>' : '') + '<div class="small ' + (V.hmsg.indexOf('✓') === 0 ? 'good' : 'bad') + '" style="margin-top:6px" id="hmsg">' + esc(V.hmsg) + '</div>' +
       '<details><summary>Cómo crear el Atajo (una sola vez)</summary><ol>' +
       '<li>En <b>Atajos</b>: <b>Buscar muestras médicas</b> (tipo <i>Steps</i>, fecha de inicio <i>es hoy</i>) → <b>Calcular estadísticas</b> (Suma) → <b>Definir variable</b> <code>pasos</code>.</li>' +
       '<li>Lo mismo con <i>Active Energy</i> → variable <code>activas</code> y con <i>Resting Energy</i> → variable <code>reposo</code> (unidad kcal).</li>' +
@@ -1473,6 +1473,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       try { V.hmsg = importHealth($('#hin').value); render(); }
       catch (e) { V.hmsg = 'No he podido leer esos datos: ' + (e.message || 'formato no válido'); var m = $('#hmsg'); if (m) { m.textContent = V.hmsg; m.className = 'small bad'; } }
     },
+    delhealth: function () { var dd = S.days[V.date]; if (dd && dd.health) { delete dd.health; touchDay(V.date); V.hmsg = ''; toast('Datos de Salud quitados'); render(); } },
     delfav: function (t) { S.favs = S.favs.filter(function (f) { return f.id !== t.dataset.id; }); touchCore(); render(); },
     export: function () {
       var o = { v: 1, profile: S.profile, weights: S.weights, favs: S.favs, settings: S.settings, days: S.days };
