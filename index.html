@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#f4f4f1" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f3ede0" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#131711" media="(prefers-color-scheme: dark)">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Calorías">
@@ -17,25 +17,24 @@
 <style>
 :root{
   color-scheme: light;
-  --bg:#f4f4f1; --surface:#ffffff; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
-  --grid:#e8e7e1; --axis:#c3c2b7; --ring:rgba(11,11,11,.08); --wash:#f0efec;
-  --shadow:0 1px 2px rgba(0,0,0,.04),0 6px 20px rgba(0,0,0,.05);
-  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s1-track:#d8e8fb;
-  --good:#006300; --warn:#a86b00; --bad:#d03b3b; --accent:#2a78d6; --onaccent:#fff;
-  --topbg:rgba(244,244,241,.88);
+  --bg:#f3ede0; --surface:#fcfaf4; --ink:#1f2a22; --ink2:#55604f; --muted:#85897a;
+  --grid:#e7dfcc; --axis:#cfc6b0; --ring:rgba(60,50,25,.10); --wash:#ece5d3;
+  --shadow:0 1px 2px rgba(60,50,25,.05),0 6px 20px rgba(60,50,25,.07);
+  --s1:#1f8550; --s2:#c28a1f; --s3:#3f78c0; --s1-track:#d9e6d3;
+  --good:#25703f; --warn:#946610; --bad:#b5473b; --accent:#2b7048; --onaccent:#fcfaf4;
+  --topbg:rgba(243,237,224,.9);
 }
 @media (prefers-color-scheme: dark){
   :root{
     color-scheme: dark;
-    --bg:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781;
-    --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.09); --wash:#262624;
+    --bg:#131711; --surface:#1c221a; --ink:#efebdd; --ink2:#bdb9a6; --muted:#8c8f7e;
+    --grid:#2a3127; --axis:#3a4236; --ring:rgba(239,235,221,.09); --wash:#252c22;
     --shadow:0 1px 2px rgba(0,0,0,.3);
-    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s1-track:#1d3556;
-    --good:#0ca30c; --warn:#fab219; --bad:#e66767; --accent:#3987e5;
-    --topbg:rgba(13,13,13,.88);
+    --s1:#63c487; --s2:#e8b64a; --s3:#7aa7e6; --s1-track:#27392c;
+    --good:#8cc59a; --warn:#e3b04a; --bad:#e58a7c; --accent:#63c487; --onaccent:#10170f;
+    --topbg:rgba(19,23,17,.9);
   }
 }
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-text-size-adjust:100%}
 body{padding:env(safe-area-inset-top) 0 calc(84px + env(safe-area-inset-bottom))}
 body.lock{overflow:hidden}
@@ -81,13 +80,13 @@ label{display:block;font-size:12.5px;color:var(--ink2);margin:0 0 4px}
 .wd .l{display:block;font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.3px}
 .wd .n{display:block;font-size:17px;font-weight:680;line-height:1.25}
 .wd .st{display:block;width:7px;height:7px;border-radius:99px;margin:3px auto 0;background:var(--grid)}
-.wd.sel{background:var(--accent);border-color:transparent;color:#fff}
+.wd.sel{background:var(--accent);border-color:transparent;color:var(--onaccent)}
 .wd.sel .l{color:rgba(255,255,255,.8)}
-.wd.sel .st{box-shadow:0 0 0 1.5px #fff}
+.wd.sel .st{box-shadow:0 0 0 1.5px var(--onaccent)}
 .wd.today:not(.sel) .n{color:var(--accent)}
 .wd:disabled{opacity:.35}
 .st.d{background:var(--s1)} .st.s{background:var(--s2)} .st.m{background:var(--s3)}
-.wd.sel .st.d,.wd.sel .st.s,.wd.sel .st.m{background:#fff}
+.wd.sel .st.d,.wd.sel .st.s,.wd.sel .st.m{background:var(--onaccent)}
 
 /* Anillo */
 .hero{display:flex;gap:16px;align-items:center}
@@ -100,7 +99,7 @@ label{display:block;font-size:12.5px;color:var(--ink2);margin:0 0 4px}
 .stat{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;font-size:14px}
 .stat b{font-size:16px}
 .pill{display:inline-flex;gap:6px;align-items:center;border-radius:99px;padding:5px 11px;font-size:13px;font-weight:650;background:var(--wash)}
-.pill.d{background:var(--s1-track);color:var(--accent)} .pill.s{background:rgba(235,104,52,.14);color:var(--s2)} .pill.m{background:rgba(27,175,122,.14);color:var(--s3)}
+.pill.d{background:var(--s1-track);color:var(--accent)} .pill.s{background:rgba(194,138,31,.16);color:var(--s2)} .pill.m{background:rgba(63,120,192,.14);color:var(--s3)}
 .meter{height:10px;border-radius:99px;background:var(--s1-track);overflow:hidden}
 .meter>i{display:block;height:100%;background:var(--s1);border-radius:99px}
 .meter.over>i{background:var(--s2)}
@@ -121,7 +120,7 @@ label{display:block;font-size:12.5px;color:var(--ink2);margin:0 0 4px}
 .sech .tt{flex:1;min-width:0}
 .sech .tt b{display:block;font-size:15.5px}
 .sech .tt span{font-size:12.5px;color:var(--muted)}
-.addb{min-width:40px;min-height:40px;padding:0;border-radius:99px;font-size:24px;line-height:1;background:var(--accent);color:#fff;border-color:transparent}
+.addb{min-width:40px;min-height:40px;padding:0;border-radius:99px;font-size:24px;line-height:1;background:var(--accent);color:var(--onaccent);border-color:transparent}
 .mrow{display:flex;align-items:center;gap:10px;padding:10px 14px;border-top:1px solid var(--grid);cursor:pointer;width:100%;text-align:left;background:transparent;border-radius:0;border-left:0;border-right:0;border-bottom:0;min-height:56px}
 .mrow .nm{flex:1;min-width:0}
 .mrow .nm b{display:block;font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -153,7 +152,7 @@ label{display:block;font-size:12.5px;color:var(--ink2);margin:0 0 4px}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 .chips{display:flex;flex-wrap:wrap;gap:8px}
 .chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--axis);border-radius:99px;padding:8px 13px;font-size:14.5px;background:var(--surface);cursor:pointer;min-height:40px}
-.chip.on{background:var(--accent);color:#fff;border-color:transparent;font-weight:650}
+.chip.on{background:var(--accent);color:var(--onaccent);border-color:transparent;font-weight:650}
 .seg2{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;background:var(--wash);border-radius:12px;padding:3px;gap:3px}
 .seg2 button{border:0;background:transparent;border-radius:9px;min-height:38px;padding:6px}
 .seg2 button.on{background:var(--surface);box-shadow:0 1px 3px rgba(0,0,0,.12);font-weight:650}
@@ -161,7 +160,7 @@ label{display:block;font-size:12.5px;color:var(--ink2);margin:0 0 4px}
 .photobox .e{font-size:30px}
 .preview{width:100%;max-height:260px;object-fit:cover;border-radius:16px;display:block}
 .pvwrap{position:relative;margin-bottom:6px}
-.pvwrap button{position:absolute;top:8px;right:8px;min-height:34px;min-width:34px;padding:0;border-radius:99px;background:rgba(0,0,0,.55);color:#fff;border:0}
+.pvwrap button{position:absolute;top:8px;right:8px;min-height:34px;min-width:34px;padding:0;border-radius:99px;background:rgba(0,0,0,.55);color:var(--onaccent);border:0}
 .item{display:grid;grid-template-columns:1fr 84px 34px;gap:8px;align-items:center;padding:9px 0;border-bottom:1px solid var(--grid)}
 .item .nm{font-size:14.5px;min-width:0}
 .item input{padding:8px;min-height:40px;text-align:right}
@@ -188,7 +187,7 @@ label{display:block;font-size:12.5px;color:var(--ink2);margin:0 0 4px}
 .tabs button{border:0;background:transparent;border-radius:10px;font-size:11px;color:var(--ink2);padding:4px 0 2px;min-height:50px;display:flex;flex-direction:column;align-items:center;gap:2px}
 .tabs button svg{width:24px;height:24px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .tabs button.on{color:var(--accent);font-weight:650}
-.tabs .plus{align-self:center;justify-self:center;width:56px;min-height:56px;height:56px;border-radius:99px;background:var(--accent);color:#fff;font-size:30px;line-height:1;padding:0;margin-top:-18px;box-shadow:0 6px 16px rgba(42,120,214,.45);display:flex;align-items:center;justify-content:center}
+.tabs .plus{align-self:center;justify-self:center;width:56px;min-height:56px;height:56px;border-radius:99px;background:var(--accent);color:var(--onaccent);font-size:30px;line-height:1;padding:0;margin-top:-18px;box-shadow:0 6px 16px rgba(42,120,214,.45);display:flex;align-items:center;justify-content:center}
 .plus span{margin-top:-3px}
 details{margin:6px 0 0} summary{cursor:pointer;color:var(--accent);font-size:14px;padding:6px 0;min-height:36px;display:flex;align-items:center}
 details ol{padding-left:20px;margin:6px 0;font-size:14px} details li{margin:5px 0}
@@ -199,7 +198,7 @@ svg text{font-family:system-ui,-apple-system,sans-serif;fill:var(--muted)}
 .readout{min-height:20px;font-size:13px;color:var(--ink2);margin:2px 0 4px}
 table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;border-bottom:1px solid var(--grid);text-align:right} th:first-child,td:first-child{text-align:left}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(96px + env(safe-area-inset-bottom));background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:12px;font-size:14px;z-index:30;max-width:90%;box-shadow:0 6px 20px rgba(0,0,0,.25)}
-.spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.5);border-top-color:#fff;border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:6px}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.5);border-top-color:var(--onaccent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:6px}
 @keyframes sp{to{transform:rotate(360deg)}}
 .pt{padding-top:calc(14px)}
 
@@ -529,7 +528,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function defaultState() {
     return {
       profile: { sex: 'm', age: 21, height: 181, weight: 78, bodyFat: null, activity: 'lig', goal: 'maintain', rate: 0.25, proteinPerKg: null, done: false },
-      weights: [], days: {}, favs: [], settings: { healthHasWorkouts: false }
+      weights: [], days: {}, favs: [], settings: { healthHasWorkouts: false }, memory: { notes: [] }
     };
   }
   var S = defaultState();
@@ -579,7 +578,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function lsDel(k) { try { localStorage.removeItem('cc:' + k); } catch (e) {} }
   function monthKey(date) { return 'm-' + date.slice(0, 7); }
   function buildDoc(key) {
-    if (key === 'core') return { profile: S.profile, weights: S.weights, favs: S.favs, settings: S.settings };
+    if (key === 'core') return { profile: S.profile, weights: S.weights, favs: S.favs, settings: S.settings, memory: S.memory };
     var prefix = key.slice(2), days = {};
     Object.keys(S.days).forEach(function (d) { if (d.slice(0, 7) === prefix) days[d] = S.days[d]; });
     return { days: days };
@@ -589,6 +588,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       if (d.profile) S.profile = Object.assign(defaultState().profile, d.profile);
       S.weights = d.weights || []; S.favs = d.favs || [];
       S.settings = Object.assign(defaultState().settings, d.settings || {});
+      S.memory = { notes: ((d.memory && d.memory.notes) || []).slice(0, 12) };
     } else if (d.days) {
       var prefix = key.slice(2);
       Object.keys(S.days).forEach(function (k) { if (k.slice(0, 7) === prefix) delete S.days[k]; });
@@ -805,8 +805,38 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function setMsg(id, text, ok) { var el = $('#' + id); if (!el) return; el.textContent = text; el.className = 'small ' + (ok === true ? 'good' : ok === false ? 'bad' : 'ink2'); }
 
 
+
+  /* Memoria: lo que la IA "va aprendiendo" de tu historial */
+  function buildMemory() {
+    var from = CC.addDays(TODAY, -120), foods = {}, keys = Object.keys(S.days).filter(function (d) { return d >= from && d < TODAY; });
+    keys.forEach(function (d) {
+      ((S.days[d] || {}).meals || []).forEach(function (m) {
+        (m.items || []).forEach(function (it) {
+          var k = String(it.n || '').toLowerCase().trim(); if (!k || !(it.g > 0)) return;
+          var f = foods[k] || (foods[k] = { n: it.n, c: 0, g: 0, k: 0, p: 0, ch: 0, f: 0 });
+          f.c++; f.g += it.g; f.k += it.k; f.p += it.p; f.ch += it.c; f.f += it.f;
+        });
+      });
+    });
+    var top = Object.keys(foods).map(function (k) { return foods[k]; }).filter(function (f) { return f.c >= 2; }).sort(function (a, b) { return b.c - a.c; }).slice(0, 20).map(function (f) {
+      return { n: f.n, veces: f.c, g_habitual: Math.round(f.g / f.c), kcal: Math.round(f.k / f.c), p: CC.round(f.p / f.c, 1), c: CC.round(f.ch / f.c, 1), f: CC.round(f.f / f.c, 1) };
+    });
+    var ctx = ctxNow(), sm = CC.summary(S, ctx, TODAY, 28), types = {};
+    keys.forEach(function (d) { var dd = S.days[d] || {}; (dd.workouts || []).concat((dd.health && dd.health.workouts) || []).forEach(function (w) { types[w.type] = (types[w.type] || 0) + 1; }); });
+    var wk = Math.max(1, keys.length / 7);
+    return { alimentos_habituales: top, dias_con_datos: keys.length, media_28d: sm ? { kcal: Math.round(sm.intake), gasto: Math.round(sm.tdee), balance: Math.round(sm.balance) } : null,
+      entrenos_por_semana: Object.keys(types).map(function (t) { return t + ' ' + CC.round(types[t] / wk, 1) + '/sem'; }), notas_previas: (S.memory && S.memory.notes) || [] };
+  }
+  function memoText() {
+    var m = buildMemory(); if (!m.alimentos_habituales.length && !m.notas_previas.length) return '';
+    var t = '\nMEMORIA DE ESTA PERSONA (su historial real; úsala para calibrar nombres, porciones y valores habituales de lo que come. Lo que diga o se vea ahora tiene prioridad):\n';
+    if (m.alimentos_habituales.length) t += 'Alimentos habituales (nombre · gramos típicos · kcal · P/C/G de esa ración · veces): ' + m.alimentos_habituales.map(function (f) { return f.n + ' · ' + f.g_habitual + ' g · ' + f.kcal + ' kcal · ' + f.p + '/' + f.c + '/' + f.f + ' · ' + f.veces; }).join(' | ') + '\n';
+    if (m.notas_previas.length) t += 'Aprendizajes previos: ' + m.notas_previas.join(' | ') + '\n';
+    return t;
+  }
+
   /* Informe con IA a partir de todo el historial */
-  var SQL_SB = "create table if not exists public.calorias_docs (\n  user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,\n  key text not null,\n  doc jsonb not null,\n  u bigint not null default 0,\n  primary key (user_id, key)\n);\nalter table public.calorias_docs enable row level security;\ncreate policy \"mis datos\" on public.calorias_docs\n  for all to authenticated\n  using (user_id = auth.uid())\n  with check (user_id = auth.uid());";
+  var SQL_SB = "-- Mis calor\u00edas \u00b7 esquema (ejecutar una vez en SQL Editor)\ncreate table if not exists public.calorias_docs (\n  user_id    uuid        not null default auth.uid() references auth.users(id) on delete cascade,\n  key        text        not null,\n  doc        jsonb       not null,\n  u          bigint      not null default 0,\n  updated_at timestamptz not null default now(),\n  primary key (user_id, key),\n  constraint calorias_docs_key_chk check (key ~ '^(core|m-[0-9]{4}-[0-9]{2})$'),\n  constraint calorias_docs_size_chk check (pg_column_size(doc) < 1048576)\n);\ncomment on table public.calorias_docs is 'core = perfil, pesos, favoritos y memoria de la IA; m-AAAA-MM = comidas y entrenos del mes';\n\ncreate or replace function public.calorias_touch() returns trigger\nlanguage plpgsql set search_path = '' as $$\nbegin new.updated_at := now(); return new; end $$;\ndrop trigger if exists calorias_touch on public.calorias_docs;\ncreate trigger calorias_touch before update on public.calorias_docs\n  for each row execute function public.calorias_touch();\n\nalter table public.calorias_docs enable row level security;\nrevoke all on public.calorias_docs from anon, public;\ngrant select, insert, update, delete on public.calorias_docs to authenticated;\ndrop policy if exists \"mis datos\" on public.calorias_docs;\ndrop policy if exists calorias_select on public.calorias_docs;\ndrop policy if exists calorias_insert on public.calorias_docs;\ndrop policy if exists calorias_update on public.calorias_docs;\ndrop policy if exists calorias_delete on public.calorias_docs;\ncreate policy calorias_select on public.calorias_docs for select to authenticated using ((select auth.uid()) = user_id);\ncreate policy calorias_insert on public.calorias_docs for insert to authenticated with check ((select auth.uid()) = user_id);\ncreate policy calorias_update on public.calorias_docs for update to authenticated using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);\ncreate policy calorias_delete on public.calorias_docs for delete to authenticated using ((select auth.uid()) = user_id);";
   function reportData(n) {
     var ctx = ctxNow(), T = CC.targets(S, ctx, TODAY), P = S.profile, days = [];
     for (var i = n; i >= 1; i--) {
@@ -817,7 +847,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     }
     var ws = S.weights.slice().sort(function (a, b) { return a.d < b.d ? -1 : 1; }).filter(function (w) { return w.d >= CC.addDays(TODAY, -Math.max(n, 30)); }).map(function (w) { return w.d + ': ' + w.kg + ' kg'; });
     var ad = T.adaptive, M = CC.muscle(S, ctx, TODAY);
-    return { perfil: { sexo: P.sex === 'm' ? 'hombre' : 'mujer', edad: P.age, altura_cm: P.height, peso_kg: P.weight, grasa_pct: P.bodyFat, objetivo: P.goal, ritmo_kg_semana: P.rate }, objetivo_diario: { kcal: Math.round(T.kcal), prot: Math.round(T.protein), hc: Math.round(T.carbs), grasa: Math.round(T.fat) }, gasto_real_estimado: ad && ad.ok ? Math.round(ad.tdee) : null, musculo: M.ok ? { nivel: M.level, notas: M.msgs } : null, pesajes: ws, dias: days };
+    return { perfil: { sexo: P.sex === 'm' ? 'hombre' : 'mujer', edad: P.age, altura_cm: P.height, peso_kg: P.weight, grasa_pct: P.bodyFat, objetivo: P.goal, ritmo_kg_semana: P.rate }, objetivo_diario: { kcal: Math.round(T.kcal), prot: Math.round(T.protein), hc: Math.round(T.carbs), grasa: Math.round(T.fat) }, gasto_real_estimado: ad && ad.ok ? Math.round(ad.tdee) : null, musculo: M.ok ? { nivel: M.level, notas: M.msgs } : null, pesajes: ws, memoria: buildMemory(), dias: days };
   }
   async function makeReport() {
     if (V.rbusy) return;
@@ -825,11 +855,12 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     V.rbusy = true; V.rmsg = ''; render();
     try {
       var data = reportData(V.rdays);
-      var prompt = 'Eres un entrenador y dietista deportivo. Analiza los datos reales de esta persona de los últimos ' + V.rdays + ' días (JSON) y escribe un informe en español, claro y directo, tuteándola. Estructura con estos apartados en Markdown sencillo (títulos con ##, listas con -, **negrita**): ## Resumen, ## Peso y tendencia, ## Calorías y macros, ## Entrenamiento, ## Qué mejorar esta semana (3-4 acciones concretas). Usa solo los datos dados, cita cifras, no inventes días sin registro (indícalo si faltan datos) y no des diagnósticos médicos. Máximo 300 palabras. Responde ÚNICAMENTE con JSON: {"informe":"<markdown>"}.\n\nDATOS:\n' + JSON.stringify(data);
+      var prompt = 'Eres un entrenador y dietista deportivo. Analiza los datos reales de esta persona de los últimos ' + V.rdays + ' días (JSON) y escribe un informe en español, claro y directo, tuteándola. Estructura con estos apartados en Markdown sencillo (títulos con ##, listas con -, **negrita**): ## Resumen, ## Peso y tendencia, ## Calorías y macros, ## Entrenamiento, ## Qué mejorar esta semana (3-4 acciones concretas). Usa solo los datos dados, cita cifras, no inventes días sin registro (indícalo si faltan datos) y no des diagnósticos médicos. Usa también "memoria" (hábitos y aprendizajes previos) para comparar con lo anterior y no repetir consejos. Máximo 300 palabras. Además devuelve "aprendizajes": 2-4 frases cortas y duraderas sobre esta persona (hábitos, respuesta de su peso a las calorías, qué le funciona) que sirvan para informes futuros; actualiza o sustituye las previas si han cambiado. Responde ÚNICAMENTE con JSON: {"informe":"<markdown>","aprendizajes":["..."]}.\n\nDATOS:\n' + JSON.stringify(data);
       var r = await aiJson(prompt);
       var txt = r && (r.informe || r.report || r.text);
       if (!txt) throw { code: 'parse' };
       lsSet('report', { d: TODAY, n: V.rdays, t: String(txt) });
+      if (r.aprendizajes && r.aprendizajes.length) { S.memory = { notes: r.aprendizajes.map(function (x) { return String(x).slice(0, 220); }).slice(0, 8) }; touchCore(); }
     } catch (e) { V.rmsg = aiErr(e); }
     V.rbusy = false; if (V.tab === 'progreso' && !V.sheet) render();
   }
@@ -870,6 +901,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     s += '- Si algo cambiaría mucho el resultado (cantidad de aceite, tipo de salsa, etc.), añade como máximo 2 preguntas cortas en "preguntas". Si no hace falta, deja la lista vacía.\n';
     s += '- Si no hay comida ni bebida identificable, devuelve "items": [] y explica en "nota".\n\n';
     s += 'FORMATO EXACTO:\n{"nombre": "nombre corto del plato", "items": [{"n": "ingrediente", "g": 150, "kcal": 248, "p": 46, "c": 0, "f": 5, "conf": "alta"}], "nota": "una frase con supuestos importantes", "preguntas": []}\n\n';
+    s += memoText();
     s += 'Momento: ' + d.type + '.\n';
     if (d.photo) s += 'Se adjunta una foto de la comida.\n';
     if (d.desc && d.desc.trim()) s += 'Descripción del usuario: ' + d.desc.trim() + '\n';
@@ -1255,6 +1287,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<div class="row" style="margin-bottom:8px">' + [7, 14, 30].map(function (n) { return '<button class="sm ' + (V.rdays === n ? 'primary' : 'ghost') + '" data-act="rdays" data-n="' + n + '">' + n + ' días</button>'; }).join('') + '</div>' +
       '<button class="primary full" data-act="report"' + (V.rbusy ? ' disabled' : '') + '>' + (V.rbusy ? 'Analizando…' : 'Generar informe') + '</button>' +
       (V.rmsg ? '<div class="small bad" style="margin-top:8px">' + esc(V.rmsg) + '</div>' : '') +
+      ((S.memory && S.memory.notes.length) ? '<div class="tiny muted" style="margin-top:10px">Lo que la IA ha aprendido de ti</div><ul class="small ink2" style="padding-left:18px;margin:4px 0">' + S.memory.notes.map(function (n) { return '<li>' + esc(n) + '</li>'; }).join('') + '</ul><button class="sm ghost danger" data-act="clearmem">Olvidar</button>' : '') +
       (rp ? '<div style="margin-top:10px"><div class="tiny muted">Último informe · ' + dmy(rp.d) + ' · ' + rp.n + ' días</div>' + mdLite(rp.t) + '</div>' : '') + '</div>';
 
     h += '<button class="ghost full" data-act="toggletable">' + (V.showTable ? 'Ocultar tabla' : 'Ver tabla de los últimos 14 días') + '</button>';
@@ -1457,6 +1490,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     toggletable: function () { V.showTable = !V.showTable; render(); },
     rdays: function (t) { V.rdays = +t.dataset.n; render(); },
     report: function () { makeReport(); },
+    clearmem: function () { S.memory = { notes: [] }; touchCore(); render(); },
     sbsql: function () { try { navigator.clipboard.writeText(SQL_SB); toast('SQL copiado'); } catch (e) { toast('Mantén pulsado el SQL para copiarlo'); } },
     sblogin: function () { sbConnect(false); },
     sbsignup: function () { sbConnect(true); },
