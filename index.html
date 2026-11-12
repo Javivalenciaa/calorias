@@ -363,6 +363,42 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     };
   }
 
+
+  /* ---------- Ayuno intermitente ---------- */
+  var FAST_BREAK = 30;   // kcal: una toma por debajo (café solo, infusión) no rompe el ayuno
+  function toMin(t) { var m = /^(\d{1,2}):(\d{2})/.exec(t || ''); return m ? (+m[1]) * 60 + (+m[2]) : null; }
+  function eatTimes(day) {
+    return ((day && day.meals) || []).filter(function (m) { return num(m.k) > FAST_BREAK && toMin(m.t) !== null; })
+      .map(function (m) { return toMin(m.t); }).sort(function (a, b) { return a - b; });
+  }
+  function hm(min) { min = Math.round(min); return ('0' + Math.floor(min / 60)).slice(-2) + ':' + ('0' + (min % 60)).slice(-2); }
+  // Ayuno que termina en la primera comida de `date` (empieza en la última comida del día anterior).
+  // Si es hoy y aún no ha comido, devuelve el ayuno en curso hasta `nowMin`.
+  function fasting(S, date, nowMin) {
+    var cur = eatTimes((S.days || {})[date]), prev = eatTimes((S.days || {})[addDays(date, -1)]);
+    var first = cur.length ? cur[0] : null, last = cur.length ? cur[cur.length - 1] : null, pl = prev.length ? prev[prev.length - 1] : null;
+    var r = { first: first, last: last, prevLast: pl, hours: null, ongoing: false, window: first !== null && cur.length > 1 ? (last - first) / 60 : null };
+    if (pl !== null && first !== null) r.hours = (1440 - pl + first) / 60;
+    else if (pl !== null && first === null && nowMin != null) { r.hours = (1440 - pl + nowMin) / 60; r.ongoing = true; }
+    return r;
+  }
+  function fastStats(S, ctx, today, n, goal) {
+    var list = [];
+    for (var i = 1; i <= n; i++) {
+      var d = addDays(today, -i), f = fasting(S, d, null);
+      if (f.hours === null) continue;
+      list.push({ date: d, hours: f.hours, window: f.window, first: f.first, last: f.last, kcal: dayInfo(S, d, ctx).intake });
+    }
+    if (!list.length) return null;
+    var sum = 0, win = 0, nw = 0, longest = 0, hit = 0, kF = 0, nF = 0, kN = 0, nN = 0;
+    list.forEach(function (x) {
+      sum += x.hours; if (x.hours > longest) longest = x.hours; if (x.window !== null) { win += x.window; nw++; }
+      if (x.hours >= goal) { hit++; if (x.kcal >= LOGGED_MIN) { kF += x.kcal; nF++; } } else if (x.kcal >= LOGGED_MIN) { kN += x.kcal; nN++; }
+    });
+    return { n: list.length, list: list, avg: sum / list.length, longest: longest, hit: hit, window: nw ? win / nw : null,
+      kcalFast: nF ? kF / nF : null, kcalNot: nN ? kN / nN : null, goal: goal };
+  }
+
   /* ---------- Resúmenes ---------- */
   function summary(S, ctx, today, nDays) {
     var list = [];
@@ -519,7 +555,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     ymd: ymd, parseYmd: parseYmd, addDays: addDays, diffDays: diffDays, num: num, round: round,
     bmr: bmr, workoutKcal: workoutKcal, makeCtx: makeCtx, slope: slope, dayTotals: dayTotals,
     dayInfo: dayInfo, summary: summary, adaptive: adaptive, calibrate: calibrate, targets: targets, muscle: muscle,
-    strengthSessions: strengthSessions, parseHealth: parseHealth, mapWorkoutType: mapWorkoutType
+    strengthSessions: strengthSessions, parseHealth: parseHealth, mapWorkoutType: mapWorkoutType,
+    FAST_BREAK: FAST_BREAK, toMin: toMin, hm: hm, fasting: fasting, fastStats: fastStats
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.CC = API;
 })(typeof window !== 'undefined' ? window : this);
@@ -570,6 +607,12 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
   function guessType() { var h = new Date().getHours(); return h < 11 ? 'Desayuno' : h < 16 ? 'Comida' : h < 19 ? 'Merienda' : 'Cena'; }
   function nowHM() { var d = new Date(); return (d.getHours() < 10 ? '0' : '') + d.getHours() + ':' + (d.getMinutes() < 10 ? '0' : '') + d.getMinutes(); }
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+  function fmtH(h) { var m = Math.round(h * 60); return Math.floor(m / 60) + ' h ' + pad2(m % 60) + ' min'; }
+  function nowMin() { var d = new Date(); return d.getHours() * 60 + d.getMinutes(); }
+  function fastGoal() { return S.settings.fastGoal > 0 ? S.settings.fastGoal : 16; }
+  var SLOT_T = { Desayuno: '09:00', Comida: '14:00', Merienda: '17:30', Cena: '21:00', Snack: '18:00' };
+  function defaultTime(date, type) { return date === TODAY ? nowHM() : (SLOT_T[mealSlot(type)] || '12:00'); }
   function ctxNow() { var c = CC.makeCtx(S); CC.calibrate(S, c, TODAY); return c; }
   function dayOf(date, create) {
     if (!S.days[date] && create) S.days[date] = { meals: [], workouts: [] };
@@ -810,7 +853,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var ctx = ctxNow(), sm = CC.summary(S, ctx, TODAY, 28), types = {};
     keys.forEach(function (d) { var dd = S.days[d] || {}; (dd.workouts || []).concat((dd.health && dd.health.workouts) || []).forEach(function (w) { types[w.type] = (types[w.type] || 0) + 1; }); });
     var wk = Math.max(1, keys.length / 7);
-    return { alimentos_habituales: top, dias_con_datos: keys.length, media_28d: sm ? { kcal: Math.round(sm.intake), gasto: Math.round(sm.tdee), balance: Math.round(sm.balance) } : null,
+    var fs = CC.fastStats(S, ctx, TODAY, 28, fastGoal());
+    return { ayuno_medio_h: fs ? CC.round(fs.avg, 1) : null, alimentos_habituales: top, dias_con_datos: keys.length, media_28d: sm ? { kcal: Math.round(sm.intake), gasto: Math.round(sm.tdee), balance: Math.round(sm.balance) } : null,
       entrenos_por_semana: Object.keys(types).map(function (t) { return t + ' ' + CC.round(types[t] / wk, 1) + '/sem'; }), notas_previas: (S.memory && S.memory.notes) || [] };
   }
   function memoText() {
@@ -827,12 +871,13 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     for (var i = n; i >= 1; i--) {
       var di = CC.dayInfo(S, CC.addDays(TODAY, -i), ctx), dd = S.days[di.date] || {};
       days.push({ fecha: di.date, registrado: !!di.logged, kcal: Math.round(di.intake), prot: Math.round(di.p), hc: Math.round(di.c), grasa: Math.round(di.f), gasto: Math.round(di.tdee), balance: di.logged ? Math.round(di.balance) : null,
+        ayuno_h: (function () { var f = CC.fasting(S, di.date, null); return f.hours === null ? null : CC.round(f.hours, 1); })(), primera_comida: (function () { var f = CC.fasting(S, di.date, null); return f.first === null ? null : CC.hm(f.first); })(), ultima_comida: (function () { var f = CC.fasting(S, di.date, null); return f.last === null ? null : CC.hm(f.last); })(),
         entrenos: (dd.workouts || []).map(function (w) { return w.type + ' ' + (w.min || '') + 'min ' + (w.kcal || '') + 'kcal'; }).concat(((dd.health && dd.health.workouts) || []).map(function (w) { return w.name + ' ' + w.min + 'min'; })),
         comidas: (dd.meals || []).map(function (m) { return m.name + ' (' + Math.round(m.k) + ' kcal)'; }).slice(0, 12) });
     }
     var ws = S.weights.slice().sort(function (a, b) { return a.d < b.d ? -1 : 1; }).filter(function (w) { return w.d >= CC.addDays(TODAY, -Math.max(n, 30)); }).map(function (w) { return w.d + ': ' + w.kg + ' kg'; });
     var ad = T.adaptive, M = CC.muscle(S, ctx, TODAY);
-    return { perfil: { sexo: P.sex === 'm' ? 'hombre' : 'mujer', edad: P.age, altura_cm: P.height, peso_kg: P.weight, grasa_pct: P.bodyFat, objetivo: P.goal, ritmo_kg_semana: P.rate }, objetivo_diario: { kcal: Math.round(T.kcal), prot: Math.round(T.protein), hc: Math.round(T.carbs), grasa: Math.round(T.fat) }, gasto_real_estimado: ad && ad.ok ? Math.round(ad.tdee) : null, musculo: M.ok ? { nivel: M.level, notas: M.msgs } : null, pesajes: ws, memoria: buildMemory(), dias: days };
+    return { perfil: { sexo: P.sex === 'm' ? 'hombre' : 'mujer', edad: P.age, altura_cm: P.height, peso_kg: P.weight, grasa_pct: P.bodyFat, objetivo: P.goal, ritmo_kg_semana: P.rate }, objetivo_diario: { kcal: Math.round(T.kcal), prot: Math.round(T.protein), hc: Math.round(T.carbs), grasa: Math.round(T.fat) }, gasto_real_estimado: ad && ad.ok ? Math.round(ad.tdee) : null, musculo: M.ok ? { nivel: M.level, notas: M.msgs } : null, pesajes: ws, ayuno: (function () { var st = CC.fastStats(S, ctx, TODAY, Math.max(n, 14), fastGoal()); return st ? { objetivo_h: st.goal, media_h: CC.round(st.avg, 1), dias_cumplidos: st.hit + '/' + st.n, ventana_media_h: st.window === null ? null : CC.round(st.window, 1), kcal_dias_con_ayuno: st.kcalFast === null ? null : Math.round(st.kcalFast), kcal_resto: st.kcalNot === null ? null : Math.round(st.kcalNot) } : null; })(), memoria: buildMemory(), dias: days };
   }
   async function makeReport() {
     if (V.rbusy) return;
@@ -840,7 +885,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     V.rbusy = true; V.rmsg = ''; render();
     try {
       var data = reportData(V.rdays);
-      var prompt = 'Eres un entrenador y dietista deportivo. Analiza los datos reales de esta persona de los últimos ' + V.rdays + ' días (JSON) y escribe un informe en español, claro y directo, tuteándola. Estructura con estos apartados en Markdown sencillo (títulos con ##, listas con -, **negrita**): ## Resumen, ## Peso y tendencia, ## Calorías y macros, ## Entrenamiento, ## Qué mejorar esta semana (3-4 acciones concretas). Usa solo los datos dados, cita cifras, no inventes días sin registro (indícalo si faltan datos) y no des diagnósticos médicos. Usa también "memoria" (hábitos y aprendizajes previos) para comparar con lo anterior y no repetir consejos. Máximo 300 palabras. Además devuelve "aprendizajes": 2-4 frases cortas y duraderas sobre esta persona (hábitos, respuesta de su peso a las calorías, qué le funciona) que sirvan para informes futuros; actualiza o sustituye las previas si han cambiado. Responde ÚNICAMENTE con JSON: {"informe":"<markdown>","aprendizajes":["..."]}.\n\nDATOS:\n' + JSON.stringify(data);
+      var prompt = 'Eres un entrenador y dietista deportivo. Analiza los datos reales de esta persona de los últimos ' + V.rdays + ' días (JSON) y escribe un informe en español, claro y directo, tuteándola. Estructura con estos apartados en Markdown sencillo (títulos con ##, listas con -, **negrita**): ## Resumen, ## Peso y tendencia, ## Calorías y macros, ## Entrenamiento, ## Ayuno (solo si hay datos: horas, ventana de comida y si ayunar le ayuda a controlar las calorías; el café solo no rompe el ayuno), ## Qué mejorar esta semana (3-4 acciones concretas). Usa solo los datos dados, cita cifras, no inventes días sin registro (indícalo si faltan datos) y no des diagnósticos médicos. Usa también "memoria" (hábitos y aprendizajes previos) para comparar con lo anterior y no repetir consejos. Máximo 300 palabras. Además devuelve "aprendizajes": 2-4 frases cortas y duraderas sobre esta persona (hábitos, respuesta de su peso a las calorías, qué le funciona) que sirvan para informes futuros; actualiza o sustituye las previas si han cambiado. Responde ÚNICAMENTE con JSON: {"informe":"<markdown>","aprendizajes":["..."]}.\n\nDATOS:\n' + JSON.stringify(data);
       var r = await aiJson(prompt);
       var txt = r && (r.informe || r.report || r.text);
       if (!txt) throw { code: 'parse' };
@@ -1050,6 +1095,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<details><summary>Ver cómo se calcula</summary><div class="kv"><span>Metabolismo + actividad diaria' + (di.source === 'salud' ? ' <span class="badge">Salud</span>' : '') + '</span><b>' + fmt(di.base * di.calib) + '</b></div><div class="kv"><span>Ejercicio</span><b>' + fmt(di.exercise * di.calib) + '</b></div>' +
       (di.calib !== 1 ? '<div class="tiny muted" style="margin-top:6px">Ajustado ×' + f2(di.calib) + ' según tu peso real de las últimas semanas.</div>' : '') + '</details></div>';
 
+    h += fastCard(isToday);
+
     var tp = T.protein, macroK = di.p * 4 + di.c * 4 + di.f * 9;
     h += '<div class="card"><div class="macro">' + macroCol('Proteína', di.p, tp, 'var(--s1)') + macroCol('Hidratos', di.c, T.carbs, 'var(--s2)') + macroCol('Grasa', di.f, T.fat, 'var(--s3)') + '</div>' +
       '<div class="tiny muted" style="margin-top:10px">Proteína objetivo: ' + f1(T.ppk) + ' g/kg · ' + fmt(T.protein) + ' g/día' + (macroK ? ' · reparto ' + Math.round(di.p * 400 / macroK) + '/' + Math.round(di.c * 400 / macroK) + '/' + Math.round(di.f * 900 / macroK) + ' %' : '') + '</div></div>';
@@ -1059,7 +1106,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       var kc = 0, pr = 0; ms.forEach(function (m) { kc += m.k; pr += m.p; });
       h += '<div class="sec"><div class="sech"><div class="ico">' + mt[1] + '</div><div class="tt"><b>' + mt[0] + '</b><span>' + (ms.length ? fmt(kc) + ' kcal · ' + fmt(pr) + ' g proteína' : 'Sin registrar') + '</span></div><button class="addb" data-act="addmeal" data-type="' + mt[0] + '" aria-label="Añadir ' + mt[0] + '">+</button></div>';
       ms.forEach(function (m) {
-        h += '<button class="mrow" data-act="editmeal" data-id="' + m.id + '"><div class="nm"><b>' + esc(m.name) + '</b><span>' + esc((m.items || []).slice(0, 3).map(function (i) { return i.n; }).join(', ')) + '</span></div><div class="kc">' + fmt(m.k) + '<span>kcal</span></div></button>';
+        h += '<button class="mrow" data-act="editmeal" data-id="' + m.id + '"><div class="nm"><b>' + esc(m.name) + '</b><span>' + (m.t ? esc(m.t) + ' · ' : '') + esc((m.items || []).slice(0, 3).map(function (i) { return i.n; }).join(', ')) + '</span></div><div class="kc">' + fmt(m.k) + '<span>kcal</span></div></button>';
       });
       h += '</div>';
     });
@@ -1133,15 +1180,16 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
   /* ---------- Editor de comida ---------- */
   function newDraft(date, type) {
-    return { id: null, date: date || V.date, type: type || guessType(), name: '', nameEdited: false, items: [], note: '', qs: [], desc: '', photo: null, busy: false, err: '', refine: '', fav: false, done: false };
+    return { id: null, t: '', date: date || V.date, type: type || guessType(), name: '', nameEdited: false, items: [], note: '', qs: [], desc: '', photo: null, busy: false, err: '', refine: '', fav: false, done: false };
   }
-  function openMeal(type, edit) { V.draft = edit || newDraft(V.date, type); openSheet('meal'); }
+  function openMeal(type, edit) { V.draft = edit || newDraft(V.date, type); if (!V.draft.t) V.draft.t = defaultTime(V.draft.date, V.draft.type); openSheet('meal'); }
   function totalsOf(items) { var t = { k: 0, p: 0, c: 0, f: 0 }; items.forEach(function (i) { t.k += i.k; t.p += i.p; t.c += i.c; t.f += i.f; }); return t; }
   function renderDraft() {
     var box = $('#draftBox'); if (!box || V.sheet !== 'meal') return; var d = V.draft; if (!d) return;
     var mode = aiMode(), h = '', tot = totalsOf(d.items);
     h += '<div class="chips" style="margin-bottom:12px">' + MEALS.map(function (m) { return '<span class="chip' + (m[0] === d.type ? ' on' : '') + '" data-act="settype" data-t="' + m[0] + '">' + m[1] + ' ' + m[0] + '</span>'; }).join('') + '</div>';
-    h += '<div class="field row"><div class="grow"><label>Día</label><input type="date" data-bind="date" value="' + d.date + '" max="' + TODAY + '"></div></div>';
+    h += '<div class="field row"><div class="grow"><label>Día</label><input type="date" data-bind="date" value="' + d.date + '" max="' + TODAY + '"></div><div style="width:120px"><label>Hora</label><input type="time" data-bind="t" value="' + esc(d.t || '') + '"></div></div>';
+    h += '<div class="chips" style="margin:-4px 0 12px"><span class="chip" data-act="coffee">☕ Café solo · no rompe el ayuno</span></div>';
     h += '<div class="card"><input type="file" id="photoIn" accept="image/*" class="hide">';
     if (d.photo) h += '<div class="pvwrap"><img class="preview" src="' + d.photo.url + '" alt="Foto de la comida"><button data-act="rmphoto" aria-label="Quitar foto">✕</button></div>';
     else h += '<button class="photobox" data-act="pickphoto"' + (BUILD === 'artifact' && AI.ready && !AI.claudeImages ? ' disabled' : '') + '><span class="e">📷</span><b>Hacer foto o elegir de la galería</b><span class="small">La IA detecta los alimentos y calcula calorías</span></button>';
@@ -1219,6 +1267,42 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
 
   /* ====================== PROGRESO ====================== */
+  /* ---------- Ayuno ---------- */
+  function fastCard(isToday) {
+    var f = CC.fasting(S, V.date, isToday ? nowMin() : null), goal = fastGoal();
+    if (f.hours === null) {
+      if (f.first === null) return '';
+      return '<div class="card"><div class="small ink2">⏱️ Primera comida: <b>' + CC.hm(f.first) + '</b>. Para medir el ayuno falta la hora de la última comida del día anterior.</div></div>';
+    }
+    var ok = f.hours >= goal, pct = Math.min(100, f.hours / goal * 100);
+    var h = '<div class="card"><div class="row sp"><h2 style="margin:0">Ayuno</h2>' + (ok ? '<span class="badge pill-ok">✓ ' + goal + ' h cumplidas</span>' : '<span class="badge">Objetivo ' + goal + ' h</span>') + '</div>';
+    h += '<div style="font-size:28px;font-weight:700;margin:6px 0 4px" ' + (f.ongoing ? 'id="fastlive" data-prev="' + f.prevLast + '"' : '') + '>' + fmtH(f.hours) + '</div>';
+    h += '<div style="height:8px;border-radius:99px;background:var(--s1-track);overflow:hidden"><div id="fastbar" style="height:100%;width:' + pct.toFixed(0) + '%;background:' + (ok ? 'var(--good)' : 'var(--s1)') + '"></div></div>';
+    if (f.ongoing) h += '<div class="small ink2" style="margin-top:8px">Ayunando desde tu última comida de ayer (<b>' + CC.hm(f.prevLast) + '</b>). ' + (ok ? 'Ya has superado el objetivo.' : 'Te faltan <b id="fastleft">' + fmtH(goal - f.hours) + '</b> para llegar a ' + goal + ' h.') + '</div>';
+    else h += '<div class="small ink2" style="margin-top:8px">Última comida de ayer <b>' + CC.hm(f.prevLast) + '</b> → primera comida <b>' + CC.hm(f.first) + '</b>.' + (f.window !== null ? ' Ventana de comida de hoy: <b>' + CC.hm(f.first) + '–' + CC.hm(f.last) + '</b> (' + fmtH(f.window) + ').' : '') + '</div>';
+    return h + '<div class="tiny muted" style="margin-top:6px">☕ Café solo, infusiones y similares (hasta ' + CC.FAST_BREAK + ' kcal) no rompen el ayuno.</div></div>';
+  }
+  function updateFastLive() {
+    var el = document.getElementById('fastlive'); if (!el || V.tab !== 'hoy') return;
+    var prev = +el.dataset.prev, hrs = (1440 - prev + nowMin()) / 60, goal = fastGoal();
+    el.textContent = fmtH(hrs);
+    var b = document.getElementById('fastbar'); if (b) b.style.width = Math.min(100, hrs / goal * 100).toFixed(0) + '%';
+    var l = document.getElementById('fastleft'); if (l) l.textContent = fmtH(Math.max(0, goal - hrs));
+  }
+  setInterval(updateFastLive, 30000);
+
+  function fastProgress() {
+    var st = CC.fastStats(S, ctxNow(), TODAY, 14, fastGoal());
+    if (!st) return '<div class="card"><h2>Ayuno</h2><p class="small ink2" style="margin:0">Aún no hay datos. Guarda la hora de tus comidas (cena de un día y primera comida del siguiente) y verás aquí tus horas de ayuno.</p></div>';
+    var goal = st.goal, bars = st.list.slice().reverse().map(function (x) {
+      return '<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:90px"><div title="' + fmtH(x.hours) + '" style="width:70%;height:' + Math.round(Math.min(x.hours, 24) / 24 * 80) + 'px;border-radius:4px 4px 0 0;background:' + (x.hours >= goal ? 'var(--s1)' : 'var(--axis)') + '"></div><div class="tiny muted">' + x.date.slice(8) + '</div></div>';
+    }).join('');
+    var h = '<div class="card"><h2>Ayuno</h2><div class="grid3" style="margin:10px 0"><div><div class="tiny muted">Media</div><b>' + fmtH(st.avg) + '</b></div><div><div class="tiny muted">Objetivo ' + goal + ' h</div><b>' + st.hit + ' de ' + st.n + ' días</b></div><div><div class="tiny muted">Más largo</div><b>' + fmtH(st.longest) + '</b></div></div>';
+    h += '<div style="position:relative;display:flex;gap:3px;align-items:flex-end;border-bottom:1px solid var(--axis)"><div style="position:absolute;left:0;right:0;bottom:' + Math.round(goal / 24 * 80 + 18) + 'px;border-top:1px dashed var(--muted);opacity:.6"></div>' + bars + '</div>';
+    if (st.window !== null) h += '<div class="small ink2" style="margin-top:8px">Ventana de comida media: <b>' + fmtH(st.window) + '</b>.</div>';
+    if (st.kcalFast !== null && st.kcalNot !== null) h += '<div class="small ink2" style="margin-top:4px">Los días que ayunas ≥ ' + goal + ' h comes de media <b>' + fmt(st.kcalFast) + ' kcal</b>; el resto, <b>' + fmt(st.kcalNot) + ' kcal</b> (' + sgn(st.kcalFast - st.kcalNot) + ').</div>';
+    return h + '</div>';
+  }
   function viewProgreso() {
     var ctx = ctxNow(), T = CC.targets(S, ctx, TODAY), ad = T.adaptive;
     var tr = ctx.trend, cur = tr.length ? tr[tr.length - 1].t : S.profile.weight;
@@ -1270,6 +1354,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<div class="kv"><span><b>Come aproximadamente</b></span><b>' + fmt(T.kcal) + ' kcal</b></div>' +
       '<div class="kv"><span>Proteína · Hidratos · Grasa</span><b>' + fmt(T.protein) + ' · ' + fmt(T.carbs) + ' · ' + fmt(T.fat) + ' g</b></div></div>';
 
+    h += fastProgress();
     var rp = lsGet('report');
     h += '<div class="card"><h2>Informe con IA</h2><p class="small ink2" style="margin-top:0">La IA lee tu historial (comidas, entrenos y pesajes) y te dice cómo vas.</p>' +
       '<div class="row" style="margin-bottom:8px">' + [7, 14, 30].map(function (n) { return '<button class="sm ' + (V.rdays === n ? 'primary' : 'ghost') + '" data-act="rdays" data-n="' + n + '">' + n + ' días</button>'; }).join('') + '</div>' +
@@ -1316,6 +1401,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<label class="row" style="color:var(--ink);font-size:15px"><input type="checkbox" id="pf-hw" style="width:22px;min-height:22px"' + (S.settings.healthHasWorkouts ? ' checked' : '') + '> Mis entrenos ya están en las calorías activas de Salud (Apple Watch)</label>' +
       '<button class="primary full" style="margin-top:12px" data-act="saveprofile">Guardar perfil</button>';
     var B = CC.bmr(P, ctx.weightAt(TODAY));
+    h += '<div class="field" style="margin-top:10px"><label>Objetivo de ayuno</label><div class="chips">' + [12, 14, 16, 18, 20].map(function (n) { return '<span class="chip' + (fastGoal() === n ? ' on' : '') + '" data-act="fastgoal" data-v="' + n + '">' + n + ' h</span>'; }).join('') + '</div></div>';
     h += '<div class="tiny muted" style="margin-top:8px">Metabolismo basal estimado: <b>' + fmt(B) + ' kcal/día</b> (' + (P.bodyFat > 3 ? 'Katch-McArdle' : 'Mifflin-St Jeor') + '). Gasto sin entrenar ≈ ' + fmt(B * CC.ACT[P.activity].f) + ' kcal.</div></div>';
 
     h += '<div class="card"><h2>Datos de Apple Salud (Atajo)</h2><p class="small ink2" style="margin-top:0">Ejecuta tu Atajo (copia tus datos de Salud al portapapeles) y pégalos aquí.</p>' +
@@ -1389,7 +1475,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     addwork: function () { openWork(); },
     editmeal: function (t) {
       var day = dayOf(V.date), m = day && day.meals.filter(function (x) { return x.id === t.dataset.id; })[0]; if (!m) return;
-      var d = newDraft(V.date, mealSlot(m.type)); d.id = m.id; d.name = m.name; d.nameEdited = true; d.done = true;
+      var d = newDraft(V.date, mealSlot(m.type)); d.id = m.id; d.t = m.t || ''; d.name = m.name; d.nameEdited = true; d.done = true;
       d.items = (m.items || []).map(function (i) { var it = { n: i.n, g: i.g, k: i.k, p: i.p, c: i.c, f: i.f, conf: i.conf || '' }; densify(it, i.g, i.k, i.p, i.c, i.f); return it; });
       openMeal(null, d);
     },
@@ -1417,6 +1503,11 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       f.items.forEach(function (i) { var it = { n: i.n, g: i.g, k: i.k, p: i.p, c: i.c, f: i.f, conf: 'alta' }; densify(it, i.g, i.k, i.p, i.c, i.f); V.draft.items.push(it); });
       if (!V.draft.name) V.draft.name = f.name; V.draft.done = true; renderDraft();
     },
+    fastgoal: function (t) { S.settings.fastGoal = +t.dataset.v; touchCore(); render(); },
+    coffee: function () {
+      var it = { n: 'Café solo', g: 200, k: 2, p: 0.3, c: 0, f: 0, conf: 'alta' }; densify(it, it.g, it.k, it.p, it.c, it.f);
+      V.draft.items.push(it); if (!V.draft.name) V.draft.name = 'Café solo'; V.draft.done = true; renderDraft();
+    },
     savemeal: function () {
       var d = V.draft; if (!d.items.length) return;
       var t = totalsOf(d.items), name = (d.name || '').trim() || (d.items[0] && d.items[0].n) || 'Comida';
@@ -1424,6 +1515,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       var day = dayOf(d.date, true), meal;
       if (d.id) { meal = day.meals.filter(function (m) { return m.id === d.id; })[0]; }
       if (!meal) { meal = { id: uid(), t: nowHM() }; day.meals.push(meal); }
+      if (d.t) meal.t = d.t;
       meal.type = d.type; meal.name = name; meal.k = Math.round(t.k); meal.p = CC.round(t.p, 1); meal.c = CC.round(t.c, 1); meal.f = CC.round(t.f, 1); meal.items = items;
       touchDay(d.date);
       if (d.fav) { S.favs.push({ id: uid(), name: name, k: meal.k, p: meal.p, items: items }); touchCore(); }
@@ -1533,6 +1625,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (!b) return;
     if (b === 'jump') { if (t.value && t.value <= TODAY) { V.date = t.value; render(); } }
     else if (b === 'date') V.draft.date = t.value || TODAY;
+    else if (b === 't') V.draft.t = t.value || '';
     else if (b === 'fav') V.draft.fav = t.checked;
     else if (b === 'wdate') { V.wt.date = t.value || TODAY; $('#sheet').innerHTML = weightHtml(); }
     else if (b === 'wfast') V.wt.fasted = t.checked;
