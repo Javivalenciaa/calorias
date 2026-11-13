@@ -1795,8 +1795,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     s += '- Los campos kcal, p, c y f son para los gramos "g" indicados (NO por 100 g). Usa valores por 100 g de tablas fiables (BEDCA/USDA) coherentes con el estado (crudo/cocinado) y multiplícalos por g/100. Debe cumplirse kcal ≈ 4·p + 4·c + 9·f.\n';
     s += '- "conf" es tu confianza en ese ingrediente: "alta", "media" o "baja".\n';
     s += '- Si algo cambiaría mucho el resultado (cantidad de aceite, tipo de salsa, etc.), añade como máximo 2 preguntas cortas en "preguntas". Si no hace falta, deja la lista vacía.\n';
-    s += '- Si no hay comida ni bebida identificable, devuelve "items": [] y explica en "nota".\n\n';
-    s += 'FORMATO EXACTO:\n{"nombre": "nombre corto del plato", "items": [{"n": "ingrediente", "g": 150, "kcal": 248, "p": 46, "c": 0, "f": 5, "conf": "alta"}], "nota": "una frase con supuestos importantes", "preguntas": []}\n\n';
+    s += '- Si no hay comida ni bebida identificable, devuelve "items": [] y explica en "nota".\n';
+    if (d.photos.length) s += '- Si la foto es una ETIQUETA, ENVASE o TABLA NUTRICIONAL (no un plato servido), NO la cuentes como comida: devuelve "items": [] y rellena "etiquetas" con el producto y los valores POR 100 g que se leen (kcal100, p100, c100, f100). Sirve de referencia para los alimentos de otras fotos.\n';
+    s += '\n';
+    s += 'FORMATO EXACTO:\n{"nombre": "nombre corto del plato", "items": [{"n": "ingrediente", "g": 150, "kcal": 248, "p": 46, "c": 0, "f": 5, "conf": "alta"}], "nota": "una frase con supuestos importantes", "preguntas": []' + (d.photos.length ? ', "etiquetas": [{"producto": "Queso Edam", "kcal100": 321, "p100": 25.4, "c100": 0, "f100": 24}]' : '') + '}\n\n';
     s += memoText();
     s += 'Momento: ' + d.type + '.\n';
     var np = d.photos.length;
@@ -1835,7 +1837,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (!todo.length) return;
     if (all) d.items = d.items.filter(function (i) { return !i.ph; });
     d.items = d.items.filter(function (i) { return i.ph !== 'desc'; });                 // la descripción ya se aplica dentro de las fotos
-    todo.forEach(function (p) { d.items = d.items.filter(function (i) { return i.ph !== p.id; }); p.status = 'busy'; p.err = ''; p.nombre = ''; p.nota = ''; p.qs = []; });
+    todo.forEach(function (p) { d.items = d.items.filter(function (i) { return i.ph !== p.id; }); p.status = 'busy'; p.err = ''; p.nombre = ''; p.nota = ''; p.qs = []; p.etq = []; });
     d.busy = true; d.err = ''; renderDraft();
     var queue = todo.slice(), fails = 0;
     async function worker() {
@@ -1845,22 +1847,49 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
           var r = await aiJson(buildPrompt(d, null, idx), p);
           if (ps.indexOf(p) < 0 || V.draft !== d) continue;                           // la quitaron mientras se analizaba
           var its = ((r && r.items) || []).map(function (i) { var it = mkItem(i.n, i.g, i.kcal, i.p, i.c, i.f, i.conf); it.ph = p.id; return it; });
-          d.items = d.items.concat(its); p.status = 'done'; p.nombre = (r && r.nombre) || ''; p.nota = (r && r.nota) || ''; p.qs = (r && r.preguntas) || [];
-          if (!its.length) { p.status = 'err'; p.err = p.nota || 'No veo comida en esta foto.'; fails++; }
+          d.items = d.items.concat(its); p.status = 'done'; p.nombre = (r && r.nombre) || ''; p.nota = (r && r.nota) || ''; p.qs = (r && r.preguntas) || []; p.etq = ((r && r.etiquetas) || []).slice(0, 6);
+          if (!its.length && p.etq.length) { p.nombre = ''; }
+          else if (!its.length) { p.status = 'err'; p.err = p.nota || 'No veo comida en esta foto.'; fails++; }
         } catch (e) { p.status = 'err'; p.err = aiErr(e); fails++; }
         renderDraft();
       }
     }
     await Promise.all([worker(), worker()]);
     if (V.draft !== d) return;
+    var cmsg = await consolidate(d, todo.length === ps.length);
     var names = [], notes = [], qs = [];
     ps.forEach(function (p, k) { if (p.nombre && names.indexOf(p.nombre) < 0) names.push(p.nombre); if (p.nota) notes.push(ps.length > 1 ? 'Foto ' + (k + 1) + ': ' + p.nota : p.nota); (p.qs || []).forEach(function (q) { qs.push(q); }); });
     if (names.length && (!d.name || !d.nameEdited)) d.name = names.join(' + ').slice(0, 60);
-    d.note = notes.join(' · '); d.qs = qs.slice(0, 2); d.done = true;
+    d.note = (cmsg ? cmsg + ' ' : '') + notes.join(' · '); d.qs = qs.slice(0, 2); d.done = true;
     var bad = ps.filter(function (p) { return p.status === 'err'; });
     if (bad.length) d.err = ps.length === 1 ? bad[0].err : bad.length + ' de ' + ps.length + ' fotos no se pudieron analizar (' + bad[0].err + '). Pulsa «Analizar» para reintentarlas.';
     d.busy = false; renderDraft();
     var res = $('#res'); if (res && res.scrollIntoView && d.items.length) res.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  // Unifica lo que sale en varias fotos (plato + envase) para no contar dos veces el mismo alimento y usar las etiquetas
+  async function consolidate(d, wasAll) {
+    var ps = d.photos, withData = ps.filter(function (p) { return p.status === 'done'; });
+    var mine = d.items.filter(function (i) { return i.ph && i.ph !== 'desc' && i.ph !== 'merged'; });
+    if (withData.length < 2 || !mine.length || aiMode() === 'none') return '';
+    var data = ps.map(function (p, k) { return { foto: k + 1, items: d.items.filter(function (i) { return i.ph === p.id; }).map(function (i) { return { n: i.n, g: i.g, kcal: i.k, p: i.p, c: i.c, f: i.f }; }), etiquetas: p.etq || [] }; });
+    var before = mine.reduce(function (a, i) { return a + i.k; }, 0);
+    var pr = 'Eres un dietista-nutricionista. UNIFICAR: varias fotos de UNA misma comida se han analizado por separado. Devuelve ÚNICAMENTE un JSON válido con la lista final sin duplicados.\n' +
+      'REGLAS:\n- Si el mismo alimento aparece en varias fotos (por ejemplo en el plato y en su envase o etiqueta), cuéntalo UNA sola vez con la cantidad más fiable: manda la descripción del usuario, luego la estimación visual del plato.\n' +
+      '- "etiquetas" son referencias nutricionales por 100 g: si un alimento coincide con una etiqueta, calcula sus kcal y macros con esos valores × g/100.\n' +
+      '- No inventes alimentos nuevos ni elimines alimentos distintos. Conserva "conf".\n- Cada alimento indica "fotos": los números de las fotos de donde sale.\n- kcal, p, c, f son para los gramos "g" indicados.\n' +
+      'FORMATO EXACTO:\n{"items": [{"n": "ingrediente", "g": 150, "kcal": 248, "p": 46, "c": 0, "f": 5, "conf": "alta", "fotos": [1, 3]}], "nota": "qué unificaste, en una frase"}\n\n' +
+      (d.desc && d.desc.trim() ? 'Descripción del usuario de toda la comida: ' + d.desc.trim() + '\n' : '') + 'RESULTADOS POR FOTO:\n' + JSON.stringify(data);
+    try {
+      var r = await aiJson(pr, null), its = (r && r.items) || [];
+      if (V.draft !== d || !its.length) return '';
+      var merged = its.map(function (i) {
+        var it = mkItem(i.n, i.g, i.kcal, i.p, i.c, i.f, i.conf), f0 = Array.isArray(i.fotos) && i.fotos.length ? ps[+i.fotos[0] - 1] : null; it.ph = f0 ? f0.id : 'merged'; return it;
+      });
+      var after = merged.reduce(function (a, i) { return a + i.k; }, 0);
+      if (after > before * 1.15 + 20 || after < before * 0.4) return 'No pude unificar los duplicados con seguridad: revisa que no haya alimentos repetidos.';
+      d.items = d.items.filter(function (i) { return !i.ph; }).concat(merged);
+      return r.nota ? 'Unificado: ' + String(r.nota).slice(0, 160) : '';
+    } catch (e) { return 'No pude unificar duplicados entre fotos: revisa que no haya alimentos repetidos.'; }
   }
   async function analyze(refine) {
     var d = V.draft;
