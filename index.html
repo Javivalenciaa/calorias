@@ -580,7 +580,14 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     return out;
   }
 
+  // Objetivo del DÍA: sigue a tu gasto real de ese día (más deporte → más margen), con el mismo déficit/superávit del plan y sin bajar del metabolismo basal
+  function dayTarget(T, di) {
+    var kcal = Math.max(di.tdee + T.offset, T.bmr), fat = Math.max(0.8 * T.kg, 0.25 * kcal / 9), carbs = Math.max(0, (kcal - 4 * T.protein - 9 * fat) / 4);
+    return Object.assign({}, T, { kcal: kcal, fat: fat, carbs: carbs, base: T.kcal, extra: kcal - T.kcal });
+  }
+
   var API = {
+    dayTarget: dayTarget,
     KCAL_KG: KCAL_KG, LOGGED_MIN: LOGGED_MIN, ACT: ACT, SPORTS: SPORTS, INTENS: INTENS,
     ymd: ymd, parseYmd: parseYmd, addDays: addDays, diffDays: diffDays, num: num, round: round,
     bmr: bmr, workoutKcal: workoutKcal, makeCtx: makeCtx, slope: slope, dayTotals: dayTotals,
@@ -1186,7 +1193,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (S.weights.length && tr.daysSince >= 8) push('peso', 'info', 'Llevas ' + tr.daysSince + ' días sin pesarte', 'Sin pesadas recientes la tendencia y el gasto real pierden precisión. Una al día, por la mañana, basta.');
     if (!yest.logged && C.dayInfo(S, add(today, -2), ctx).logged) push('ayer', 'info', 'Ayer no registraste comidas', 'Si comiste, añádelo: un día en blanco falsea tu media y tu gasto real.');
     if (T && nowMin >= 19 * 60 && T.protein > 0 && di.p < 0.6 * T.protein) push('prot', 'warn', 'Proteína baja: ' + Math.round(di.p) + ' de ' + Math.round(T.protein) + ' g', 'Te faltan ' + Math.round(T.protein - di.p) + ' g. Algo como yogur griego, atún, claras o un batido te acerca sin pasarte de kcal.');
-    if (T && nowMin >= 21 * 60 && di.intake > T.kcal * 1.15 && di.logged) push('kcal', 'info', 'Hoy vas por encima: ' + Math.round(di.intake) + ' de ' + Math.round(T.kcal) + ' kcal', 'Un día no cambia nada; lo que cuenta es la media semanal.');
+    var tdy = T ? C.dayTarget(T, di).kcal : 0;
+    if (T && nowMin >= 21 * 60 && di.intake > tdy * 1.15 && di.logged) push('kcal', 'info', 'Hoy vas por encima: ' + Math.round(di.intake) + ' de ' + Math.round(tdy) + ' kcal', 'Un día no cambia nada; lo que cuenta es la media semanal.');
     if (T && P.goal === 'lose') {
       var kg = T.kg || P.weight;
       if (T.kcal <= T.bmr * 1.02) push('agresivo', 'warn', 'Tu objetivo está muy cerca del metabolismo basal', 'Comer por debajo o igual que tu basal (' + Math.round(T.bmr) + ' kcal) aumenta el riesgo de perder músculo y de rebote. Baja el ritmo de pérdida en Ajustes.');
@@ -1266,6 +1274,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     st.protDays = T ? lg.filter(function (x) { return x.p >= 0.9 * T.protein; }).length : 0;
     st.tdee = lg.length ? mean(lg.map(function (x) { return x.tdee; })) : null;
     st.balance = lg.length ? mean(lg.map(function (x) { return x.balance; })) : null;
+    function tk(x) { return T ? C.dayTarget(T, x).kcal : 0; }
+    st.budget = lg.length && T ? mean(lg.map(tk)) : null;
     var workouts = 0, gym = 0, sets = 0, steps = [], dayN = 0;
     for (var d2 = start; d2 <= end; d2 = add(d2, 1)) {
       var dd = S.days[d2] || {}; var ws = dd.workouts || [];
@@ -1276,7 +1286,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var a = trendAt(ctx, add(start, -1)), b = trendAt(ctx, end);
     st.dKg = a != null && b != null ? b - a : null;
     if (T && lg.length) {                                                   // mejor y peor día respecto al objetivo
-      var sc = lg.map(function (x) { return { d: x.date, e: Math.abs(x.intake - T.kcal) / T.kcal + (x.p < 0.9 * T.protein ? 0.1 : 0), k: x.intake }; }).sort(function (x, y) { return x.e - y.e; });
+      var sc = lg.map(function (x) { return { d: x.date, e: Math.abs(x.intake - tk(x)) / tk(x) + (x.p < 0.9 * T.protein ? 0.1 : 0), k: x.intake }; }).sort(function (x, y) { return x.e - y.e; });
       st.best = sc[0]; st.worst = sc[sc.length - 1];
     }
     return st;
@@ -1288,16 +1298,16 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var did = [], fix = [];
     if (cur.logged >= 6) did.push('Registraste ' + cur.logged + ' de 7 días: datos fiables.'); else fix.push('Solo registraste ' + cur.logged + ' de 7 días.');
     if (T && cur.kcal != null) {
-      var dev = (cur.kcal - T.kcal) / T.kcal;
-      if (Math.abs(dev) <= 0.07) did.push('Media de ' + g3(cur.kcal) + ' kcal, a menos de un 7 % de tu objetivo (' + g3(T.kcal) + ').');
-      else fix.push('Media de ' + g3(cur.kcal) + ' kcal, ' + (dev > 0 ? 'por encima' : 'por debajo') + ' de tu objetivo (' + g3(T.kcal) + ').');
+      var tgt = cur.budget || T.kcal, dev = (cur.kcal - tgt) / tgt;
+      if (Math.abs(dev) <= 0.07) did.push('Media de ' + g3(cur.kcal) + ' kcal, a menos de un 7 % de tu objetivo de la semana (' + g3(tgt) + ').');
+      else fix.push('Media de ' + g3(cur.kcal) + ' kcal, ' + (dev > 0 ? 'por encima' : 'por debajo') + ' de tu objetivo de la semana (' + g3(tgt) + ').');
       if (T.protein > 0 && cur.logged) { if (cur.protDays >= Math.ceil(cur.logged * 0.7)) did.push('Proteína alcanzada ' + cur.protDays + ' de ' + cur.logged + ' días.'); else fix.push('Proteína alcanzada solo ' + cur.protDays + ' de ' + cur.logged + ' días (media ' + Math.round(cur.protein) + ' g).'); }
     }
     if (cur.gym > 0) did.push(cur.gym + ' entreno(s) de fuerza, ' + cur.sets + ' series.'); else if (cur.workouts === 0) fix.push('Ningún entrenamiento registrado.');
     // Una sola recomendación, por prioridad
     if (cur.logged < 5) focus = 'Esta semana, registra al menos 5 días (mejor 7). Sin datos completos no puedo ajustar tu gasto real.';
     else if (T && cur.logged && cur.protDays < Math.ceil(cur.logged * 0.5) && T.protein > 0) focus = 'Sube la proteína: añade ~' + Math.round(Math.max(20, T.protein - cur.protein)) + ' g al día (p. ej. 1 ración extra de pollo, atún, yogur griego o un batido).';
-    else if (T && cur.kcal != null && Math.abs((cur.kcal - T.kcal) / T.kcal) > 0.1) focus = 'Acércate a tu objetivo de ' + g3(T.kcal) + ' kcal: ahora vas ' + (cur.kcal > T.kcal ? 'unas ' + Math.round(cur.kcal - T.kcal) + ' por encima' : 'unas ' + Math.round(T.kcal - cur.kcal) + ' por debajo') + ' de media.';
+    else if (T && cur.kcal != null && Math.abs((cur.kcal - (cur.budget || T.kcal)) / (cur.budget || T.kcal)) > 0.1) focus = 'Acércate a tu objetivo medio de ' + g3(cur.budget || T.kcal) + ' kcal: ahora vas ' + (cur.kcal > (cur.budget || T.kcal) ? 'unas ' + Math.round(cur.kcal - (cur.budget || T.kcal)) + ' por encima' : 'unas ' + Math.round((cur.budget || T.kcal) - cur.kcal) + ' por debajo') + ' de media.';
     else if (tr.rate14 != null && P.goal !== 'maintain' && Math.abs(tr.rate14 - planned) > 0.25 && cur.logged >= 5) {
       var adj = Math.round((planned - tr.rate14) * KCAL_KG / 7 / 50) * 50;
       focus = 'Tu peso se mueve a ' + r2(tr.rate14) + ' kg/sem y tu plan era ' + r2(planned) + '. Ajusta ' + (adj > 0 ? '+' : '') + adj + ' kcal al día durante 2 semanas y reevalúa.';
@@ -2007,15 +2017,16 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
 
   function viewHoy() {
-    var ctx = ctxNow(), di = CC.dayInfo(S, V.date, ctx), T = CC.targets(S, ctx, TODAY), day = dayOf(V.date) || { meals: [], workouts: [] };
+    var ctx = ctxNow(), di = CC.dayInfo(S, V.date, ctx), T0 = CC.targets(S, ctx, TODAY), T = CC.dayTarget(T0, di), day = dayOf(V.date) || { meals: [], workouts: [] };
     var h = topBar(ctx) + ghome();
     if (!S.profile.done) h += '<div class="banner"><b>Empieza aquí:</b> rellena tu perfil (edad, altura, peso y objetivo) para que los cálculos sean precisos.<br><button class="sm primary" data-act="tab" data-t="ajustes" style="margin-top:8px">Ir a mi perfil</button></div>';
     else if (aiMode() === 'none' && AI.ready !== false && BUILD === 'web') h += '<div class="banner"><b>IA no disponible.</b> ' + (CFG.ok ? 'Falta una clave de IA en Vercel.' : 'Esta app necesita el servidor de Vercel con sus variables de entorno.') + ' Mientras tanto puedes añadir comidas a mano.</div>';
 
-    h += cAlerts(T, ctx);
+    h += cAlerts(T0, ctx);
     var remaining = T.kcal - di.intake, over = remaining < 0;
     h += '<div class="card hero"><div class="ringwrap">' + ringSvg(di.intake / T.kcal, over) + '<div class="ringc"><b>' + fmt(Math.abs(remaining)) + '</b><span>' + (over ? 'kcal de más' : 'kcal restantes') + '</span></div></div>' +
-      '<div class="stats"><div class="stat"><span class="muted">Objetivo</span><b>' + fmt(T.kcal) + '</b></div><div class="stat"><span class="muted">Comido</span><b>' + fmt(di.intake) + '</b></div><div class="stat"><span class="muted">Ejercicio</span><b>' + fmt(di.exercise * di.calib) + '</b></div></div></div>';
+      '<div class="stats"><div class="stat"><span class="muted">Objetivo de hoy</span><b>' + fmt(T.kcal) + '</b></div><div class="stat"><span class="muted">Comido</span><b>' + fmt(di.intake) + '</b></div><div class="stat"><span class="muted">Ejercicio</span><b>' + fmt(di.exercise * di.calib) + '</b></div></div></div>' +
+      '<div class="tiny muted" style="margin:-4px 6px 10px;text-align:center">Tu objetivo se mueve con tu gasto de cada día: ' + fmt(di.tdee) + ' de gasto ' + (T.offset < 0 ? '− ' + fmt(-T.offset) + ' de déficit' : T.offset > 0 ? '+ ' + fmt(T.offset) + ' de superávit' : '(mantenimiento)') + (Math.abs(T.extra) >= 50 ? ' · ' + sgn(T.extra) + ' kcal frente a un día normal' : '') + '.</div>';
 
     var isToday = V.date === TODAY;
     var endK = isToday ? Math.max(di.intake, T.kcal) : di.intake, bal = endK - di.tdee;
@@ -2080,7 +2091,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<div class="small ink2" style="margin-top:10px">' + (done.length ? 'Proteína media <b>' + fmt(sP / done.length) + ' g</b> (objetivo ' + fmt(T.protein) + ') · ' + sess + ' entreno(s) · ' + done.length + ' día(s) completos registrados.' : 'Aún no hay días completos registrados esta semana (el día de hoy cuenta cuando termina).') + '</div></div>';
     h += '<div class="sec">';
     for (i = 0; i < 7; i++) {
-      var d2 = CC.addDays(ws, i), x = infos[i], fut = d2 > TODAY, pct = x ? Math.min(100, x.intake / T.kcal * 100) : 0, ov = x && x.intake > T.kcal;
+      var d2 = CC.addDays(ws, i), x = infos[i], fut = d2 > TODAY, tg = x ? CC.dayTarget(T, x).kcal : T.kcal, pct = x ? Math.min(100, x.intake / tg * 100) : 0, ov = x && x.intake > tg;
       var dw = S.days[d2], wk = dw ? (dw.workouts || []).length + ((dw.health && dw.health.workouts) || []).length : 0;
       var bcls = x && x.logged ? (x.balance < -150 ? 'd' : x.balance > 150 ? 's' : 'm') : '';
       h += '<button class="dayrow' + (d2 === TODAY ? ' today' : '') + (fut ? ' fut' : '') + '" data-act="openday" data-d="' + d2 + '"' + (fut ? ' disabled' : '') + '><div class="dn"><b>' + WL[i] + '</b><span>' + (+d2.slice(8)) + '</span></div><div class="mid2"><b style="font-size:15px">' + relLabel(d2) + '</b><div class="meter' + (ov ? ' over' : '') + '"><i style="width:' + pct + '%"></i></div><span class="small muted">' + (x && x.intake ? fmt(x.intake) + ' / ' + fmt(T.kcal) + ' kcal' : fut ? '' : 'Sin registrar') + (wk ? ' · 🏋️ ' + wk : '') + '</span></div>' +
@@ -2297,7 +2308,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
     h += '<div class="card"><h2>Objetivo recomendado</h2><div class="kv"><span>Gasto de referencia' + (T.source === 'real' ? ' <span class="badge">real</span>' : '') + '</span><b>' + fmt(T.ref) + ' kcal</b></div>' +
       '<div class="kv"><span>Ajuste por objetivo</span><b>' + sgn(T.offset) + ' kcal</b></div>' +
-      '<div class="kv"><span><b>Come aproximadamente</b></span><b>' + fmt(T.kcal) + ' kcal</b></div>' +
+      '<div class="kv"><span><b>Come aproximadamente</b> <span class="tiny muted">(día normal; cada día se ajusta a tu ejercicio)</span></span><b>' + fmt(T.kcal) + ' kcal</b></div>' +
       '<div class="kv"><span>Proteína · Hidratos · Grasa</span><b>' + fmt(T.protein) + ' · ' + fmt(T.carbs) + ' · ' + fmt(T.fat) + ' g</b></div></div>';
 
     h += fastProgress();
@@ -2969,7 +2980,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var w = CO.weekly(S, ctx, T, TODAY), c = w.cur, p = w.prev, h = '<div class="card"><h2>Resumen de la semana</h2><div class="tiny muted" style="margin:-4px 0 10px">' + cdate(c.start) + ' → ' + cdate(c.end) + '</div>';
     if (!c.logged) return h + '<p class="small ink2">Aún no hay días registrados la semana pasada. Registra tus comidas y aquí verás cómo vas, con un único cambio recomendado.</p></div>';
     function d(a, b, u, dec) { return b == null || a == null ? '' : '<div class="tiny ' + (a - b > 0 ? '' : '') + 'muted">' + (a - b >= 0 ? '+' : '') + (dec ? f1(a - b) : fmt(a - b)) + u + ' vs. anterior</div>'; }
-    h += '<div class="grid3" style="margin-bottom:10px"><div><div class="mid">' + fmt(c.kcal) + '</div><div class="muted tiny">kcal/día (obj. ' + fmt(T.kcal) + ')</div>' + d(c.kcal, p.kcal, '', 0) + '</div>' +
+    h += '<div class="grid3" style="margin-bottom:10px"><div><div class="mid">' + fmt(c.kcal) + '</div><div class="muted tiny">kcal/día (obj. ' + fmt(c.budget || T.kcal) + ')</div>' + d(c.kcal, p.kcal, '', 0) + '</div>' +
       '<div><div class="mid">' + c.protDays + '/' + c.logged + '</div><div class="muted tiny">días con proteína</div></div>' +
       '<div><div class="mid">' + (c.dKg != null ? sgn(c.dKg, 1) : '—') + '</div><div class="muted tiny">kg (tendencia)</div></div></div>';
     h += '<ul class="small ink2" style="padding-left:18px;margin:6px 0">' + w.did.map(function (t) { return '<li>✅ ' + esc(t) + '</li>'; }).join('') + w.fix.map(function (t) { return '<li>🔸 ' + esc(t) + '</li>'; }).join('') + '</ul>';
