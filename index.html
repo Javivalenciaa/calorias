@@ -811,7 +811,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     russian: [0.4, 0, 1.0], pallof: [0.3, 0, 1.0], woodchop: [0.8, 0, 1.0], dead_bug: [0.4, 0.1, 1.0],
     clean: [0.8, 0.3, 1.2], thruster: [1.0, 0.65, 1.15], db_swing: [0.7, 0.2, 1.1], farmer: [0.15, 0.0, 1.0], db_thruster: [1.0, 0.65, 1.15]
   };
-  var DB2 = { db_bench: 1, db_inc: 1, db_fly: 1, db_fly_inc: 1, db_ohp: 1, arnold: 1, lateral: 1, front_raise: 1, rear_fly: 1, shrug_db: 1, rdl_db: 1, farmer: 1, db_thruster: 1, lunge: 1, rev_lunge: 1, bulgarian: 1, step_up: 1 };
+  var DB2 = { db_curl: 1, hammer: 1, incline_curl: 1, db_skull: 1, row_cs: 1, db_bench: 1, db_inc: 1, db_fly: 1, db_fly_inc: 1, db_ohp: 1, arnold: 1, lateral: 1, front_raise: 1, rear_fly: 1, shrug_db: 1, rdl_db: 1, farmer: 1, db_thruster: 1, lunge: 1, rev_lunge: 1, bulgarian: 1, step_up: 1 };
   function phys(e) {
     var d = OVR[e.id] || DEF[e.g] || DEF.cuerpo, bwf = e.o.bw != null ? e.o.bw : d[1];
     var alpha = e.id.indexOf('calf') === 0 ? ALPHA.calf : (e.g === 'pierna' || e.g === 'gluteo' || e.g === 'cuerpo') ? ALPHA.low : ALPHA.up;
