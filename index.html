@@ -881,8 +881,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   // Estimación de la sesión. g = { start, end, retro, exs: [{ ex, sets:[{w,r,t,ty,done}] | min,speed,inc,watts,lvl,t }] }
   function estimate(g, kg, custom, opts) {
     kg = kg > 20 ? kg : 75;
-    var effSets = 0, sumIw = 0, sumW = 0, events = [], byEx = {}, lift = 0, light = 0, cardio = 0, workSec = 0, restSec = 0, vol = 0, nsets = 0, nwork = 0;
-    function addEx(id, k) { byEx[id] = (byEx[id] || 0) + k; }
+    var effSets = 0, sumIw = 0, sumW = 0, events = [], byEx = {}, byXi = {}, lift = 0, light = 0, cardio = 0, workSec = 0, restSec = 0, vol = 0, nsets = 0, nwork = 0;
+    function addEx(id, k, xi) { byEx[id] = (byEx[id] || 0) + k; byXi[xi] = (byXi[xi] || 0) + k; }
     (g.exs || []).forEach(function (x, xi) {
       var e = exOf(x.ex, custom);
       if (isCardio(e)) {
@@ -894,7 +894,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     });
     var live = !g.retro && g.start && events.length && events.every(function (ev) { return ev.t > 0; });
     if (live) events.sort(function (a, b) { return a.t - b.t; });
-    var prevT = live ? g.start : 0, first = true, lastEx = null;
+    var prevT = live ? g.start : 0, first = true, lastEx = null, lastXi = 0;
     events.forEach(function (ev) {
       var e = ev.e, rest, pre = 0;
       if (live) {
@@ -904,11 +904,11 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       } else rest = ev.cardio ? 0 : (ev.x && num(ev.x.rest) > 0 ? num(ev.x.rest) : restDefault(e));
       first = false;
       if (ev.cardio) {
-        var kc = cardioKcal(e, ev.x, kg); cardio += kc; addEx(e.id, kc); workSec += ev.d;
-        if (live) { var rr = lightNet(Math.min(rest, 120), kg); light += rr; restSec += Math.min(rest, 120); addEx(e.id, rr); }
+        var kc = cardioKcal(e, ev.x, kg); cardio += kc; addEx(e.id, kc, ev.xi); workSec += ev.d;
+        if (live) { var rr = lightNet(Math.min(rest, 120), kg); light += rr; restSec += Math.min(rest, 120); addEx(e.id, rr, ev.xi); }
       } else {
         var w = setKcal(e, ev.s, kg, opts), r = lightNet(rest, kg), pk = pre > 0 ? lightNet(pre, kg) : 0;
-        lift += w; light += r + pk; addEx(e.id, w + r + pk); workSec += ev.d; restSec += rest + pre;
+        lift += w; light += r + pk; addEx(e.id, w + r + pk, ev.xi); workSec += ev.d; restSec += rest + pre;
         if (ev.s.ty !== 'w') {
           var rr0 = Math.max(0, num(ev.s.r)), inten = rr0 > 0 && rr0 <= 25 ? 1 / (1 + rr0 / 30) : 0.5, ph = phys(e);
           sumIw += inten * w; sumW += w;
@@ -917,10 +917,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
         if (ev.s.ty !== 'w') { nwork++; if (e.k === 'wr' || e.k === 'bw') vol += num(ev.s.w) * num(ev.s.r); }
         nsets++;
       }
-      lastEx = e;
+      lastEx = e; lastXi = ev.xi;
     });
     if (live && g.end && events.length) {              // enfriamiento tras la última serie
-      var tail = Math.max(0, (g.end - prevT) / 1000), tk = lightNet(tail, kg); light += tk; restSec += tail; if (lastEx) addEx(lastEx.id, tk);
+      var tail = Math.max(0, (g.end - prevT) / 1000), tk = lightNet(tail, kg); light += tk; restSec += tail; if (lastEx) addEx(lastEx.id, tk, lastXi);
     }
     // EPOC agudo: crece con la intensidad media (≈ %1RM por reps) y con descansos cortos
     var avgI = sumW > 0 ? sumIw / sumW : 0.65, avgRest = nsets ? restSec / nsets : 120;
@@ -935,12 +935,13 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (spanMin > 0 && lift + light + epoc > cap - cardio) total = cap;
     var acute = total, base = Math.max(1e-9, lift + light + cardio), f = total / base;
     var bd = Object.keys(byEx).map(function (id) { return { ex: id, kcal: byEx[id] * f }; });
+    var bx = {}; Object.keys(byXi).forEach(function (i) { bx[i] = byXi[i] * f; });
     return {
       kcal: Math.round(total + post), lo: Math.round(acute * 0.75 + post * 0.3), hi: Math.round(acute * 1.3 + post * 1.6),
       post: Math.round(post), epocF: Math.round(epocF * 100) / 100,
       lift: Math.round(lift * f), light: Math.round(light * f), cardio: Math.round(cardio * f), epoc: Math.round(epoc * f),
       min: Math.round(spanMin), workSec: Math.round(workSec), restSec: Math.round(restSec),
-      vol: Math.round(vol), sets: nwork, allSets: nsets, byEx: bd, live: !!live
+      vol: Math.round(vol), sets: nwork, allSets: nsets, byEx: bd, byXi: bx, live: !!live
     };
   }
 
@@ -2634,6 +2635,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (!x.sets) return fmt(x.min) + ' min' + (x.speed ? ' · ' + gnum(x.speed) + ' km/h' : '') + (x.inc ? ' · ' + gnum(x.inc) + ' %' : '') + (x.watts ? ' · ' + fmt(x.watts) + ' W' : '');
     return x.sets.map(function (s) { return (s.ty === 'w' ? 'C ' : '') + (e.k === 't' ? s.r + ' s' : e.k === 'bw' ? (s.w > 0 ? '+' + gnum(s.w) + '×' : '') + s.r : gnum(s.w) + '×' + s.r); }).join(' · ');
   }
+  function gbyXi(est, xi) { return est.byXi && est.byXi[xi] != null ? est.byXi[xi] : 0; }
   function gbyEx(est, id) { var f = est.byEx.filter(function (b) { return b.ex === id; })[0]; return f ? f.kcal : 0; }
   function gsumHtml() {
     var m = V.gsum, e = m.est, g = V.gym, kg = gkg();
@@ -2645,7 +2647,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     h += '<div class="card"><div class="row sp"><div><b>Guardar como rutina</b><div class="tiny muted">La próxima vez la empiezas con un toque</div></div><button class="sm" data-act="gsaveroutine">' + (m.rsaved ? '✓ Guardada' : 'Guardar') + '</button></div></div>';
     h += '<div class="card"><h2>Nombre del entreno</h2><input data-bind="gyname" value="' + esc(m.name) + '"></div>';
     h += '<div class="card"><h2>Por ejercicio</h2>';
-    m.exs.forEach(function (x) { var k = gbyEx(e, x.ex); h += '<div class="kv"><div class="grow" style="min-width:0"><b>' + esc(gex(x.ex).n) + (m.prs[x.ex] ? ' <span class="badge" style="color:var(--accent);border-color:var(--accent)">🏆 PR</span>' : '') + '</b><div class="tiny muted">' + esc(gsetsText(x)) + '</div></div><div style="text-align:right"><b>' + fmt(k) + '</b><div class="tiny muted">kcal</div></div></div>'; });
+    m.exs.forEach(function (x, xi) { var k = gbyXi(e, xi); h += '<div class="kv"><div class="grow" style="min-width:0"><b>' + esc(gex(x.ex).n) + (m.prs[x.ex] ? ' <span class="badge" style="color:var(--accent);border-color:var(--accent)">🏆 PR</span>' : '') + '</b><div class="tiny muted">' + esc(gsetsText(x)) + '</div></div><div style="text-align:right"><b>' + fmt(k) + '</b><div class="tiny muted">kcal</div></div></div>'; });
     h += '</div>';
     h += '<div class="card"><div class="field" style="margin:0"><label>¿Tu reloj marca otra cifra? Escríbela aquí (opcional)</label><input data-bind="gyover" type="number" inputmode="numeric" value="' + esc(m.over) + '" placeholder="' + fmt(e.kcal) + '"></div></div>';
     h += '<div class="card"><details><summary style="margin:0">Cómo se calcula</summary><div class="small ink2" style="margin-top:8px;line-height:1.5">' +
@@ -2665,7 +2667,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var h = '<div class="sheetin"><div class="stop"><button class="ghost" data-act="closesheet">Cerrar</button><h1 style="font-size:20px;flex:1;text-align:center">' + esc(w.name || 'Entreno') + '</h1><span style="min-width:64px"></span></div>' +
       '<div class="card"><div class="muted small" style="text-align:center">' + esc(shortDate(V.date)) + '</div><div class="bignum">' + fmt(w.kcal) + '</div><div class="tiny muted" style="text-align:center">kcal netas' + (gg.model && gg.model !== w.kcal ? ' (tú) · el modelo daba ' + fmt(gg.model) : '') + '</div>' +
       '<div class="grid3" style="margin-top:14px;text-align:center"><div><div class="mid">' + fmt(w.min) + '</div><div class="tiny muted">minutos</div></div><div><div class="mid">' + fmt(gg.sets || 0) + '</div><div class="tiny muted">series</div></div><div><div class="mid">' + fmt(gg.vol || 0) + '</div><div class="tiny muted">kg movidos</div></div></div></div><div class="card"><h2>Ejercicios</h2>';
-    (gg.exs || []).forEach(function (x) { h += '<div class="kv"><div class="grow" style="min-width:0"><b>' + esc(gex(x.ex).n) + '</b><div class="tiny muted">' + esc(gsetsText(x)) + '</div></div><div style="text-align:right"><b>' + fmt(gbyEx(est, x.ex)) + '</b><div class="tiny muted">kcal</div></div></div>'; });
+    (gg.exs || []).forEach(function (x, xi) { h += '<div class="kv"><div class="grow" style="min-width:0"><b>' + esc(gex(x.ex).n) + '</b><div class="tiny muted">' + esc(gsetsText(x)) + '</div></div><div style="text-align:right"><b>' + fmt(gbyXi(est, xi)) + '</b><div class="tiny muted">kcal</div></div></div>'; });
     return h + '</div><button class="primary full" data-act="grepeat" data-id="' + w.id + '" style="margin-bottom:8px">Repetir este entreno</button><button class="ghost danger full" data-act="delwork" data-id="' + w.id + '" data-close="1">Borrar entreno</button></div>';
   }
 
