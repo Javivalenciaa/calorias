@@ -228,6 +228,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 .grest .mid{font-size:22px}
 .gs input::placeholder{color:var(--muted);opacity:.65;font-weight:500}
 
+.pvgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:6px}.pvgrid .pvwrap{margin:0}.pvgrid .preview{height:140px;max-height:none}.pvst{position:absolute;left:8px;bottom:8px;min-width:28px;height:28px;border-radius:99px;background:rgba(0,0,0,.55);color:#fff;display:flex;align-items:center;justify-content:center;font-size:14px;padding:0 6px}.pvst:empty{display:none}
+
 </style>
 </head>
 <body>
@@ -1780,10 +1782,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var cv = document.createElement('canvas'); cv.width = Math.round(w * sc); cv.height = Math.round(h * sc);
     cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
     var blob = await new Promise(function (r) { cv.toBlob(r, 'image/jpeg', 0.85); });
-    return { blob: blob, b64: await blobToB64(blob), url: URL.createObjectURL(blob) };
+    return { id: 'p' + uid(), status: 'new', blob: blob, b64: await blobToB64(blob), url: URL.createObjectURL(blob) };
   }
 
-  function buildPrompt(d, refine) {
+  function buildPrompt(d, refine, pi) {
     var s = 'Eres un dietista-nutricionista experto en estimar calorías y macronutrientes a partir de fotos y descripciones de comida (cocina española e internacional). Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después.\n\n';
     s += 'REGLAS:\n';
     s += '- Separa cada alimento o ingrediente en su propia línea. Incluye aceite de cocinar, salsas, pan, bebidas y suplementos (p. ej. batido de proteína) si se ven o se mencionan.\n';
@@ -1797,8 +1799,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     s += 'FORMATO EXACTO:\n{"nombre": "nombre corto del plato", "items": [{"n": "ingrediente", "g": 150, "kcal": 248, "p": 46, "c": 0, "f": 5, "conf": "alta"}], "nota": "una frase con supuestos importantes", "preguntas": []}\n\n';
     s += memoText();
     s += 'Momento: ' + d.type + '.\n';
-    if (d.photo) s += 'Se adjunta una foto de la comida.\n';
-    if (d.desc && d.desc.trim()) s += 'Descripción del usuario: ' + d.desc.trim() + '\n';
+    var np = d.photos.length;
+    if (pi != null && np > 1) s += 'Se adjunta la foto ' + (pi + 1) + ' de ' + np + ' de la MISMA comida (las demás fotos se analizan por separado). Analiza SOLO lo que aparece en ESTA foto; no añadas lo que se vea en las otras.\n';
+    else if (np) s += 'Se adjunta una foto de la comida.\n';
+    if (d.desc && d.desc.trim()) s += (pi != null && np > 1) ? 'Descripción del usuario de TODA la comida (' + (pi === 0 ? 'aplica lo que corresponda a esta foto; si menciona ingredientes que no se ven en ninguna foto, inclúyelos aquí' : 'úsala solo para afinar cantidades de lo que veas en esta foto; NO añadas ingredientes que no se vean') + '): ' + d.desc.trim() + '\n' : 'Descripción del usuario: ' + d.desc.trim() + '\n';
     if (refine) {
       s += '\nRESULTADO ACTUAL (editado por el usuario):\n' + JSON.stringify({ nombre: d.name, items: d.items.map(function (i) { return { n: i.n, g: i.g, kcal: i.k, p: i.p, c: i.c, f: i.f }; }) });
       s += '\n\nCORRECCIÓN DEL USUARIO: ' + refine + '\nAplica la corrección y devuelve el JSON COMPLETO actualizado con el mismo formato.\n';
@@ -1819,17 +1823,52 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
   function applyResult(r) {
     var d = V.draft; var items = (r && r.items) || [];
-    d.items = items.map(function (i) { return mkItem(i.n, i.g, i.kcal, i.p, i.c, i.f, i.conf); });
+    d.items = items.map(function (i) { var it = mkItem(i.n, i.g, i.kcal, i.p, i.c, i.f, i.conf); if (!d.photos.length) it.ph = 'desc'; return it; });
+    d.photos.forEach(function (p) { if (p.status !== 'busy') p.status = 'done'; });
     if (r && r.nombre && (!d.name || !d.nameEdited)) d.name = String(r.nombre).slice(0, 60);
     d.note = (r && r.nota) || ''; d.qs = ((r && r.preguntas) || []).slice(0, 2); d.done = true;
     if (!d.items.length) d.err = d.note || 'No he identificado comida en esto. Prueba con otra foto o describe lo que has comido.';
   }
+  // Cada foto se analiza por separado y todos los alimentos se suman en la misma comida
+  async function analyzePhotos(all) {
+    var d = V.draft, ps = d.photos, todo = ps.filter(function (p) { return all || p.status !== 'done'; });
+    if (!todo.length) return;
+    if (all) d.items = d.items.filter(function (i) { return !i.ph; });
+    d.items = d.items.filter(function (i) { return i.ph !== 'desc'; });                 // la descripción ya se aplica dentro de las fotos
+    todo.forEach(function (p) { d.items = d.items.filter(function (i) { return i.ph !== p.id; }); p.status = 'busy'; p.err = ''; p.nombre = ''; p.nota = ''; p.qs = []; });
+    d.busy = true; d.err = ''; renderDraft();
+    var queue = todo.slice(), fails = 0;
+    async function worker() {
+      while (queue.length) {
+        var p = queue.shift(), idx = ps.indexOf(p);
+        try {
+          var r = await aiJson(buildPrompt(d, null, idx), p);
+          if (ps.indexOf(p) < 0 || V.draft !== d) continue;                           // la quitaron mientras se analizaba
+          var its = ((r && r.items) || []).map(function (i) { var it = mkItem(i.n, i.g, i.kcal, i.p, i.c, i.f, i.conf); it.ph = p.id; return it; });
+          d.items = d.items.concat(its); p.status = 'done'; p.nombre = (r && r.nombre) || ''; p.nota = (r && r.nota) || ''; p.qs = (r && r.preguntas) || [];
+          if (!its.length) { p.status = 'err'; p.err = p.nota || 'No veo comida en esta foto.'; fails++; }
+        } catch (e) { p.status = 'err'; p.err = aiErr(e); fails++; }
+        renderDraft();
+      }
+    }
+    await Promise.all([worker(), worker()]);
+    if (V.draft !== d) return;
+    var names = [], notes = [], qs = [];
+    ps.forEach(function (p, k) { if (p.nombre && names.indexOf(p.nombre) < 0) names.push(p.nombre); if (p.nota) notes.push(ps.length > 1 ? 'Foto ' + (k + 1) + ': ' + p.nota : p.nota); (p.qs || []).forEach(function (q) { qs.push(q); }); });
+    if (names.length && (!d.name || !d.nameEdited)) d.name = names.join(' + ').slice(0, 60);
+    d.note = notes.join(' · '); d.qs = qs.slice(0, 2); d.done = true;
+    var bad = ps.filter(function (p) { return p.status === 'err'; });
+    if (bad.length) d.err = ps.length === 1 ? bad[0].err : bad.length + ' de ' + ps.length + ' fotos no se pudieron analizar (' + bad[0].err + '). Pulsa «Analizar» para reintentarlas.';
+    d.busy = false; renderDraft();
+    var res = $('#res'); if (res && res.scrollIntoView && d.items.length) res.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
   async function analyze(refine) {
     var d = V.draft;
     if (aiMode() === 'none') return;
-    if (!d.photo && !(d.desc && d.desc.trim())) { d.err = 'Añade una foto o describe lo que has comido.'; renderDraft(); return; }
+    if (!d.photos.length && !(d.desc && d.desc.trim())) { d.err = 'Añade una foto o describe lo que has comido.'; renderDraft(); return; }
+    if (d.photos.length && !refine) { return analyzePhotos(d.photos.every(function (p) { return p.status === 'done'; })); }
     d.busy = true; d.err = ''; renderDraft();
-    try { var r = await aiJson(buildPrompt(d, refine), d.photo); applyResult(r); d.refine = ''; }
+    try { var r = await aiJson(buildPrompt(d, refine), d.photos.length === 1 ? d.photos[0] : null); applyResult(r); d.refine = ''; }
     catch (e) { d.err = aiErr(e); }
     d.busy = false; renderDraft();
     var res = $('#res'); if (res && res.scrollIntoView && !d.err) res.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -2051,7 +2090,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
   /* ---------- Editor de comida ---------- */
   function newDraft(date, type) {
-    return { id: null, t: '', date: date || V.date, type: type || guessType(), name: '', nameEdited: false, items: [], note: '', qs: [], desc: '', photo: null, busy: false, err: '', refine: '', fav: false, done: false };
+    return { id: null, t: '', date: date || V.date, type: type || guessType(), name: '', nameEdited: false, items: [], note: '', qs: [], desc: '', photos: [], busy: false, err: '', refine: '', fav: false, done: false };
   }
   function openMeal(type, edit) { V.draft = edit || newDraft(V.date, type); if (!V.draft.t) V.draft.t = defaultTime(V.draft.date, V.draft.type); openSheet('meal'); }
   function totalsOf(items) { var t = { k: 0, p: 0, c: 0, f: 0 }; items.forEach(function (i) { t.k += i.k; t.p += i.p; t.c += i.c; t.f += i.f; }); return t; }
@@ -2061,12 +2100,17 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     h += '<div class="chips" style="margin-bottom:12px">' + MEALS.map(function (m) { return '<span class="chip' + (m[0] === d.type ? ' on' : '') + '" data-act="settype" data-t="' + m[0] + '">' + m[1] + ' ' + m[0] + '</span>'; }).join('') + '</div>';
     h += '<div class="field row"><div class="grow"><label>Día</label><input type="date" data-bind="date" value="' + d.date + '" max="' + TODAY + '"></div><div style="width:120px"><label>Hora</label><input type="time" data-bind="t" value="' + esc(d.t || '') + '"></div></div>';
     h += '<div class="chips" style="margin:-4px 0 12px"><span class="chip" data-act="coffee">☕ Café solo · no rompe el ayuno</span></div>';
-    h += '<div class="card"><input type="file" id="photoIn" accept="image/*" class="hide">';
-    if (d.photo) h += '<div class="pvwrap"><img class="preview" src="' + d.photo.url + '" alt="Foto de la comida"><button data-act="rmphoto" aria-label="Quitar foto">✕</button></div>';
-    else h += '<button class="photobox" data-act="pickphoto"' + (BUILD === 'artifact' && AI.ready && !AI.claudeImages ? ' disabled' : '') + '><span class="e">📷</span><b>Hacer foto o elegir de la galería</b><span class="small">La IA detecta los alimentos y calcula calorías</span></button>';
+    h += '<div class="card"><input type="file" id="photoIn" accept="image/*" multiple class="hide">';
+    var dis = BUILD === 'artifact' && AI.ready && !AI.claudeImages ? ' disabled' : '';
+    if (d.photos.length) {
+      h += '<div class="pvgrid">' + d.photos.map(function (p, k) {
+        return '<div class="pvwrap"><img class="preview" src="' + p.url + '" alt="Foto ' + (k + 1) + ' de la comida"><span class="pvst">' + (p.status === 'busy' ? '<span class="spin"></span>' : p.status === 'done' ? '✓' : p.status === 'err' ? '⚠️' : '') + '</span><button data-act="rmphoto" data-i="' + k + '" aria-label="Quitar foto ' + (k + 1) + '">✕</button></div>';
+      }).join('') + (d.photos.length < 6 ? '<button class="photobox" data-act="pickphoto"' + dis + ' style="min-height:0;height:100%"><span class="e">＋</span><b>Otra foto</b></button>' : '') + '</div>' +
+        (d.photos.length > 1 ? '<div class="tiny muted" style="margin:2px 0 4px">Cada foto se analiza por separado y se suman todas en esta comida.</div>' : '');
+    } else h += '<button class="photobox" data-act="pickphoto"' + dis + '><span class="e">📷</span><b>Hacer foto o elegir de la galería</b><span class="small">Puedes subir varias: se analizan por separado y se suman</span></button>';
     h += '<div class="field" style="margin-top:12px"><label>Descripción (opcional, mejora mucho la precisión)</label><textarea data-bind="desc" placeholder="Ej: 200 g de arroz cocido, pechuga a la plancha (150 g), 1 cucharada de aceite de oliva, ensalada sin aliñar">' + esc(d.desc) + '</textarea></div>';
     if (mode === 'none') h += '<div class="banner">' + (BUILD === 'web' ? 'La IA no está disponible ahora mismo (revisa la configuración del servidor). Puedes añadir alimentos a mano o usar favoritos.' : 'El análisis con IA no está disponible aquí. Puedes añadir alimentos a mano o usar favoritos.') + '</div>';
-    h += '<button class="primary full" data-act="analyze"' + (d.busy || mode === 'none' ? ' disabled' : '') + '>' + (d.busy ? '<span class="spin"></span>Analizando…' : '✨ Analizar con IA') + '</button>';
+    h += '<button class="primary full" data-act="analyze"' + (d.busy || mode === 'none' ? ' disabled' : '') + '>' + (d.busy ? '<span class="spin"></span>Analizando…' : (function () { var pend = d.photos.filter(function (p) { return p.status !== 'done'; }).length; return !d.photos.length ? '✨ Analizar con IA' : pend ? '✨ Analizar ' + (pend === 1 ? '1 foto' : pend + ' fotos') + ' con IA' : '↻ Analizar de nuevo'; })()) + '</button>';
     if (d.err) h += '<p class="bad small" role="alert" style="margin:8px 0 0">' + esc(d.err) + '</p>';
     h += '<details><summary>Consejos para más precisión</summary><ol><li>Pon un cubierto o tu mano al lado para dar escala.</li><li>Di qué aceite o salsa llevaba y cuánto (1 cucharada ≈ 10 g).</li><li>Indica gramos si los pesaste, y si son en crudo o cocinado.</li><li>Para productos envasados usa «Añadir a mano» con la etiqueta (por 100 g).</li></ol></details></div>';
 
@@ -2357,7 +2401,13 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     },
     settype: function (t) { V.draft.type = t.dataset.t; renderDraft(); },
     pickphoto: function () { var i = $('#photoIn'); if (i) i.click(); },
-    rmphoto: function () { var d = V.draft; if (d.photo && d.photo.url) { try { URL.revokeObjectURL(d.photo.url); } catch (e) {} } d.photo = null; renderDraft(); },
+    rmphoto: function (t) {
+      var d = V.draft, p = d.photos[+t.dataset.i]; if (!p) return;
+      try { URL.revokeObjectURL(p.url); } catch (e) {}
+      d.photos.splice(+t.dataset.i, 1); d.items = d.items.filter(function (i) { return i.ph !== p.id; });     // quitar la foto quita sus alimentos
+      if (!d.photos.length && !d.items.length) { d.done = false; d.note = ''; d.qs = []; if (!d.nameEdited) d.name = ''; }
+      renderDraft();
+    },
     analyze: function () { analyze(''); },
     refine: function () { var d = V.draft; if (!d.refine || !d.refine.trim()) { d.err = 'Escribe qué quieres corregir.'; renderDraft(); return; } analyze(d.refine.trim()); },
     rmitem: function (t) { V.draft.items.splice(+t.dataset.i, 1); renderDraft(); },
@@ -3061,9 +3111,14 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   document.addEventListener('change', async function (e) {
     var t = e.target, b = t.dataset && t.dataset.bind;
     if (t.id === 'photoIn') {
-      var f = t.files && t.files[0]; if (!f) return; var d = V.draft; if (!d) return;
-      d.err = ''; d.busy = true; renderDraft();
-      try { d.photo = await (window.__prepPhoto || prepPhoto)(f); } catch (x) { d.err = 'No he podido leer esa foto. Prueba con otra.'; }
+      var fs = Array.prototype.slice.call(t.files || []); var d = V.draft; if (!fs.length || !d) return;
+      d.err = ''; d.busy = true; renderDraft(); var bad = 0;
+      for (var q = 0; q < fs.length; q++) {
+        if (d.photos.length >= 6) { d.err = 'Máximo 6 fotos por comida.'; break; }
+        try { var ph = await (window.__prepPhoto || prepPhoto)(fs[q]); ph.id = ph.id || 'p' + uid(); ph.status = ph.status || 'new'; d.photos.push(ph); } catch (x) { bad++; }
+      }
+      if (bad) d.err = bad === fs.length ? 'No he podido leer esa foto. Prueba con otra.' : 'No he podido leer ' + bad + ' foto(s).';
+      try { t.value = ''; } catch (x) {}
       d.busy = false; renderDraft(); return;
     }
     if (!b) return;
