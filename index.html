@@ -546,7 +546,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function parseHealth(text, todayStr) {
     text = String(text || '').trim();
     if (!text) throw new Error('Vacío');
-    var out = { date: todayStr, steps: 0, active: 0, resting: 0, weight: 0, workouts: [] };
+    var out = { date: todayStr, steps: 0, active: 0, resting: 0, weight: 0, sleep: 0, workouts: [] };
     var obj = null;
     if (text[0] === '{') { try { obj = JSON.parse(text); } catch (e) { obj = null; } }
     function setKey(k, v) {
@@ -556,6 +556,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       else if (/^(activas|active|activekcal|activeenergy|energiaactiva|kcalactivas)$/.test(k)) out.active = num(v);
       else if (/^(reposo|resting|restingkcal|restingenergy|energiareposo|basal)$/.test(k)) out.resting = num(v);
       else if (/^(peso|weight|masacorporal|bodymass)$/.test(k)) out.weight = num(v);
+      else if (/^(sueno|sueño|sleep|horasdesueno|horasdesueño|sleephours)$/.test(k)) { var sv = num(v); out.sleep = sv > 24 ? sv / 60 : sv; }
       else if (/^(entreno|entrenos|workout|workouts|entrenamiento)$/.test(k)) addWorkout(v);
     }
     function addWorkout(v) {
@@ -573,7 +574,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
         if (m) setKey(m[1], m[2]);
       });
     }
-    if (!out.steps && !out.active && !out.resting && !out.weight && !out.workouts.length) throw new Error('No he encontrado datos reconocibles');
+    if (!out.steps && !out.active && !out.resting && !out.weight && !out.sleep && !out.workouts.length) throw new Error('No he encontrado datos reconocibles');
     return out;
   }
 
@@ -994,6 +995,72 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     });
     return out;
   }
+
+  /* ---------- Progresión doble (qué pesar y cuántas reps la próxima vez) ----------
+     Rango de reps según el ejercicio; cuando TODAS las series llegan al tope del rango se sube la carga y las reps vuelven a la parte baja
+     (progresión doble, ACSM 2009: +2–10 % cuando se superan las reps objetivo). Si dos sesiones seguidas no llegas al mínimo, baja ≈ 7–10 %. */
+  var ISO = /curl|ext|fly|lateral|raise|kick|calf|crunch|shrug|pullover|skull|hammer|face_pull|rear|pallof|leg_ext|leg_curl|abd/;
+  function repRange(e) {
+    if (e.id.indexOf('calf') === 0 || e.g === 'core') return [12, 20];
+    if (e.k === 'bw') return [6, 15];
+    return ISO.test(e.id) ? [10, 15] : [6, 10];
+  }
+  function stepOf(e, w) {
+    var eq = e.eq || [], dumb = eq.indexOf('manc') >= 0 || DB2[e.id];
+    if (dumb) return w >= 10 ? 2 : 1;
+    if (eq.indexOf('barra') >= 0 || eq.indexOf('rack') >= 0) return (w >= 100 && (e.g === 'pierna' || e.g === 'espalda')) ? 5 : 2.5;
+    return 2.5;
+  }
+  function roundTo(x, st) { return Math.round(x / st) * st; }
+  function sessionsOf(S, exId, n) {
+    var all = gymWorkouts(S), custom = (S.settings && S.settings.custom) || [], e = exOf(exId, custom), out = [];
+    for (var i = all.length - 1; i >= 0 && out.length < n; i--) {
+      var xs = (all[i].w.gym.exs || []).filter(function (x) { return x.ex === exId; });
+      if (!xs.length) continue;
+      var ws = workingSets(e, [].concat.apply([], xs.map(function (x) { return x.sets || []; })));
+      if (ws.length) out.push({ date: all[i].date, sets: ws });
+    }
+    return out;
+  }
+  function suggest(S, exId, kg, custom) {
+    var e = exOf(exId, custom || (S.settings && S.settings.custom) || []);
+    if (isCardio(e) || e.k === 't') return null;
+    var ss = sessionsOf(S, exId, 3); if (!ss.length) return null;
+    var last = ss[0], rng = repRange(e), lo = rng[0], hi = rng[1];
+    var ws = last.sets.map(function (x) { return num(x.w); }), W = Math.max.apply(null, ws);   // carga de trabajo = la más alta usada
+    var top = last.sets.filter(function (x) { return num(x.w) >= W * 0.999; }), reps = top.map(function (x) { return num(x.r); });
+    var minR = Math.min.apply(null, reps), allTop = reps.length >= 2 ? reps.every(function (r) { return r >= hi; }) : reps[0] >= hi;
+    var res = { from: { w: W, r: reps }, lo: lo, hi: hi, date: last.date };
+    var el = e1rm(e, { w: W, r: Math.max.apply(null, reps) }, kg) || 0, bwf = e.o.bw ? e.o.bw * kg : 0, st = stepOf(e, W);
+    function repsAt(w2) { var L = w2 + bwf; return el > 0 && L > 0 ? Math.max(lo, Math.min(hi, Math.round(30 * (el / L - 1)))) : lo; }
+    var prev = ss[1], prevMin = prev ? Math.min.apply(null, prev.sets.filter(function (x) { return num(x.w) >= Math.max.apply(null, prev.sets.map(function (y) { return num(y.w); })) * 0.999; }).map(function (x) { return num(x.r); })) : null;
+    if (allTop) {
+      if (e.k === 'bw' && W === 0) { res.kind = 'subir'; res.w = 2.5; res.r = lo; res.msg = 'Llegaste a ' + hi + ' reps en todas: añade 2,5 kg de lastre y vuelve a ' + lo + ' reps.'; return res; }
+      var w2 = roundTo(W + Math.max(st, W * 0.025), st); if (w2 <= W) w2 = W + st;
+      res.kind = 'subir'; res.w = w2; res.r = repsAt(w2); res.msg = 'Hiciste ' + reps.join(', ') + ' con ' + fnum(W) + ' kg: sube a ' + fnum(w2) + ' kg y busca ~' + res.r + ' reps.';
+    } else if (minR < lo && prevMin != null && prevMin < lo && prev && Math.max.apply(null, prev.sets.map(function (y) { return num(y.w); })) >= W * 0.999) {
+      var w3 = Math.max(0, roundTo(W * 0.92, st)); if (w3 >= W) w3 = Math.max(0, W - st);
+      res.kind = 'bajar'; res.w = w3; res.r = repsAt(w3); res.msg = 'Dos sesiones seguidas por debajo de ' + lo + ' reps: baja a ' + fnum(w3) + ' kg, recupera técnica y vuelve a subir.';
+    } else {
+      var tgt = Math.min(hi, Math.max(minR + 1, lo));
+      res.kind = 'mantener'; res.w = W; res.r = tgt; res.msg = 'Misma carga (' + fnum(W) + ' kg): intenta ' + tgt + ' reps en todas las series (tope del rango: ' + hi + ').';
+    }
+    // estancamiento: sin mejora del 1RM estimado en 3 sesiones
+    if (ss.length >= 3) {
+      var es = ss.map(function (s2) { return Math.max.apply(null, s2.sets.map(function (x) { return e1rm(e, x, kg); })); });
+      if (es[0] <= es[2] * 1.005 && es[1] <= es[2] * 1.005 && res.kind === 'mantener') res.msg += ' Llevas 3 sesiones sin mejorar: revisa descanso y sueño, o prueba una descarga del 10 %.';
+    }
+    return res;
+  }
+  function fnum(n) { return String(Math.round(n * 100) / 100).replace('.', ','); }
+  // Zona de volumen semanal por grupo (series efectivas/semana): ≥10 maximiza el crecimiento (Schoenfeld 2017); >20 exige vigilar la recuperación
+  function zoneOf(n) {
+    if (n <= 0) return { z: 'nada', t: 'sin trabajar', c: 0 };
+    if (n < 6) return { z: 'bajo', t: 'mantienes lo que tienes', c: 1 };
+    if (n < 10) return { z: 'medio', t: 'crecimiento moderado', c: 2 };
+    if (n <= 20) return { z: 'optimo', t: 'zona óptima de crecimiento', c: 3 };
+    return { z: 'alto', t: 'mucho volumen: cuida la recuperación', c: 4 };
+  }
   function autoName(exs, custom) {
     var cnt = {}; (exs || []).forEach(function (x) { var e = exOf(x.ex, custom); if (isCardio(e)) return; var n = (x.sets || []).length; cnt[e.g] = (cnt[e.g] || 0) + n; });
     var gs = Object.keys(cnt).sort(function (a, b) { return cnt[b] - cnt[a]; });
@@ -1012,9 +1079,299 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     exOf: exOf, isCardio: isCardio, available: available, catalog: catalog, search: search, restDefault: restDefault,
     setKcal: setKcal, phys: phys, treadmillKcal: treadmillKcal, bikeKcal: bikeKcal, minKcal: minKcal, estimate: estimate,
     validSet: validSet, effLoad: effLoad, e1rm: e1rm, gymWorkouts: gymWorkouts, workingSets: workingSets,
-    lastPerf: lastPerf, records: records, weeklySets: weeklySets, autoName: autoName, TEMPO: TEMPO
+    lastPerf: lastPerf, suggest: suggest, repRange: repRange, zoneOf: zoneOf, sessionsOf: sessionsOf, records: records, weeklySets: weeklySets, autoName: autoName, TEMPO: TEMPO
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.CG = API;
+})(typeof window !== 'undefined' ? window : this);
+
+</script>
+<script>
+/* Entrenador: tendencia, predicción vs realidad, alertas, "qué como ahora", resumen semanal y correlaciones.
+   Módulo puro (sin DOM). Depende de CC (calc.js). Global: CO. */
+(function (root) {
+  'use strict';
+  var C = (typeof module !== 'undefined' && module.exports) ? require('./calc.js') : root.CC;
+  var KCAL_KG = C.KCAL_KG || 7700, DAY_ADAPT = 11;   // kcal/día que baja el gasto por cada kg perdido (Hall 2011/2012: ≈ 10–12)
+  var num = C.num, add = C.addDays, diff = C.diffDays;
+
+  function mean(a) { return a.length ? a.reduce(function (s, x) { return s + x; }, 0) / a.length : 0; }
+  function g3(x) { return String(Math.round(x)).replace(/\B(?=(\d{3})+(?!\d))/g, '.'); }
+  function r1(x) { return Math.round(x * 10) / 10; }
+  function r2(x) { return Math.round(x * 100) / 100; }
+  function noCalib(ctx) { return Object.assign({}, ctx, { calib: 1 }); }
+  function trendAt(ctx, date) {            // peso tendencia (EMA) conocido a fin de ese día; null si aún no hay datos
+    var v = null; for (var i = 0; i < ctx.trend.length; i++) { if (ctx.trend[i].d <= date) v = ctx.trend[i].t; else break; } return v;
+  }
+
+  /* ---------- 1. Tendencia de peso y fecha del objetivo ---------- */
+  function trendInfo(S, ctx, today) {
+    var ws = ctx.weights, out = { n: ws.length, now: null, rate7: null, rate14: null, rate28: null, rate: null };
+    if (!ws.length) return out;
+    out.now = trendAt(ctx, today) != null ? trendAt(ctx, today) : ws[ws.length - 1].kg;
+    out.last = ws[ws.length - 1];
+    out.daysSince = diff(out.last.d, today);
+    [7, 14, 28].forEach(function (n) { var sl = C.slope(ws, add(today, -n), today); out['rate' + n] = sl ? sl.perDay * 7 : null; });
+    out.rate = out.rate14 != null ? out.rate14 : (out.rate28 != null ? out.rate28 : null);   // kg/semana (regresión, no el ruido de un día)
+    var raw = ws.filter(function (w) { return w.d >= add(today, -14); });
+    if (raw.length >= 3 && out.rate != null) {                                                 // ruido típico: desviación del peso respecto a la recta
+      var sl = C.slope(ws, add(today, -14), today), x0 = raw[0].d, my = mean(raw.map(function (w) { return w.kg; })), mx = mean(raw.map(function (w) { return diff(x0, w.d); }));
+      var res = raw.map(function (w) { return w.kg - (my + sl.perDay * (diff(x0, w.d) - mx)); });
+      out.noise = Math.sqrt(mean(res.map(function (x) { return x * x; })));
+    }
+    return out;
+  }
+
+  // Simula día a día: el gasto baja ≈ 11 kcal por kg perdido (y sube si engordas)
+  function forecast(w0, tdee0, intake, weeks, goalKg) {
+    var pts = [], w = w0, reach = null;
+    for (var d = 1; d <= weeks * 7; d++) {
+      var tdee = tdee0 + DAY_ADAPT * (w - w0);
+      w += (intake - tdee) / KCAL_KG;
+      if (goalKg != null && reach === null && ((goalKg < w0 && w <= goalKg) || (goalKg > w0 && w >= goalKg))) reach = d;
+      if (d % 7 === 0) pts.push({ week: d / 7, kg: w });
+    }
+    return { pts: pts, end: w, reachDays: reach };
+  }
+
+  /* ---------- 2. Predicción vs realidad (semana a semana, sin trampas: solo datos anteriores a cada semana) ---------- */
+  function weekRows(S, ctx0, today, nWeeks) {
+    var rows = [], f = noCalib(ctx0);
+    for (var i = 0; i < nWeeks; i++) {
+      var end = add(today, -1 - 7 * i), start = add(end, -6), startKg = trendAt(ctx0, add(start, -1)), endKg = trendAt(ctx0, end);
+      var list = [], inW = 0;
+      for (var k = 0; k < 7; k++) { var di = C.dayInfo(S, add(start, k), f); if (di.logged) list.push(di); }
+      ctx0.weights.forEach(function (w) { if (w.d >= start && w.d <= end) inW++; });
+      var row = { start: start, end: end, days: list.length, weighIns: inW, ok: false };
+      if (list.length >= 4 && inW >= 2 && startKg != null && endKg != null) {
+        var avgIn = mean(list.map(function (d) { return d.intake; })), avgF = mean(list.map(function (d) { return d.tdee; }));
+        var ad = C.adaptive(S, ctx0, add(start, -1)), learned = (ad.ok && ad.conf !== 'baja') ? ad.tdee : null;
+        var actual = endKg - startKg;                                                // kg en 7 días (tendencia, sin ruido de agua)
+        row.ok = true; row.intake = avgIn; row.formula = avgF; row.actual = actual;
+        row.predFormula = (avgIn - avgF) * 7 / KCAL_KG;
+        row.predLearned = learned != null ? (avgIn - learned) * 7 / KCAL_KG : null;
+        row.realTdee = avgIn - actual * KCAL_KG / 7;
+        row.errFormula = actual - row.predFormula;
+        row.errLearned = row.predLearned != null ? actual - row.predLearned : null;
+      }
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  function learn(S, ctx0, today, nWeeks) {
+    var rows = weekRows(S, ctx0, today, nWeeks || 8), ok = rows.filter(function (r) { return r.ok; });
+    var out = { rows: rows, n: ok.length, ready: ok.length >= 3 };
+    if (!ok.length) return out;
+    var wts = ok.map(function (r, i) { return Math.pow(0.8, i); }), sw = wts.reduce(function (a, b) { return a + b; }, 0);
+    out.realTdee = ok.reduce(function (s, r, i) { return s + r.realTdee * wts[i]; }, 0) / sw;      // gasto real medido (más peso a lo reciente)
+    out.formula = ok.reduce(function (s, r, i) { return s + r.formula * wts[i]; }, 0) / sw;
+    out.gap = out.realTdee - out.formula;
+    out.maeFormula = mean(ok.map(function (r) { return Math.abs(r.errFormula); }));
+    var lr = ok.filter(function (r) { return r.errLearned != null; });
+    out.maeLearned = lr.length ? mean(lr.map(function (r) { return Math.abs(r.errLearned); })) : null;
+    out.hit = ok.filter(function (r) { return Math.abs(r.errFormula) <= 0.25; }).length;
+    var pos = ok.filter(function (r) { return Math.abs(r.predLearned != null ? r.predLearned : r.predFormula) >= 0.1; });
+    out.dirOk = pos.filter(function (r) { var pr = r.predLearned != null ? r.predLearned : r.predFormula; return (pr > 0) === (r.actual > 0); }).length; out.dirN = pos.length;
+    out.conf = ok.length >= 6 ? 'alta' : ok.length >= 4 ? 'media' : 'baja';
+    return out;
+  }
+
+  /* ---------- 8. Alertas inteligentes ---------- */
+  function alerts(S, ctx, T, today, nowMin, opt) {
+    opt = opt || {}; var out = [], P = S.profile, tr = trendInfo(S, ctx, today), di = C.dayInfo(S, today, ctx), yest = C.dayInfo(S, add(today, -1), ctx);
+    function push(id, lvl, t, d) { out.push({ id: id, lvl: lvl, t: t, d: d }); }
+    if (S.weights.length && tr.daysSince >= 8) push('peso', 'info', 'Llevas ' + tr.daysSince + ' días sin pesarte', 'Sin pesadas recientes la tendencia y el gasto real pierden precisión. Una al día, por la mañana, basta.');
+    if (!yest.logged && C.dayInfo(S, add(today, -2), ctx).logged) push('ayer', 'info', 'Ayer no registraste comidas', 'Si comiste, añádelo: un día en blanco falsea tu media y tu gasto real.');
+    if (T && nowMin >= 19 * 60 && T.protein > 0 && di.p < 0.6 * T.protein) push('prot', 'warn', 'Proteína baja: ' + Math.round(di.p) + ' de ' + Math.round(T.protein) + ' g', 'Te faltan ' + Math.round(T.protein - di.p) + ' g. Algo como yogur griego, atún, claras o un batido te acerca sin pasarte de kcal.');
+    if (T && nowMin >= 21 * 60 && di.intake > T.kcal * 1.15 && di.logged) push('kcal', 'info', 'Hoy vas por encima: ' + Math.round(di.intake) + ' de ' + Math.round(T.kcal) + ' kcal', 'Un día no cambia nada; lo que cuenta es la media semanal.');
+    if (T && P.goal === 'lose') {
+      var kg = T.kg || P.weight;
+      if (T.kcal <= T.bmr * 1.02) push('agresivo', 'warn', 'Tu objetivo está muy cerca del metabolismo basal', 'Comer por debajo o igual que tu basal (' + Math.round(T.bmr) + ' kcal) aumenta el riesgo de perder músculo y de rebote. Baja el ritmo de pérdida en Ajustes.');
+      else if (num(P.rate, 0.25) / kg > 0.0125) push('ritmo', 'warn', 'Ritmo de pérdida muy rápido', 'Más de ~1 % del peso corporal por semana suele costar músculo. Con ' + r2(kg) + ' kg, lo prudente es ≤ ' + r2(kg * 0.0125) + ' kg/sem.');
+      if (tr.rate14 != null && tr.rate14 / kg < -0.0125 && tr.rate28 != null && tr.rate28 / kg < -0.01) push('rapido', 'warn', 'Estás perdiendo más rápido de lo recomendable', 'Tu tendencia es ' + r2(tr.rate14) + ' kg/sem. Sube la ingesta unas 150–250 kcal para proteger el músculo.');
+      var ad = T.adaptive; if (ad && ad.ok && ad.days >= 18 && tr.rate28 != null && tr.rate28 > -0.05 && T.kcal < di.tdee) push('estanca', 'info', 'Peso estancado ~4 semanas', 'Tu gasto real medido es ' + Math.round(ad.tdee) + ' kcal. Si sigues sin bajar con tu objetivo, revisa porciones y registros o resta ~100–150 kcal.');
+    }
+    if (opt.lastBackup !== undefined) {
+      var ds = opt.lastBackup ? diff(C.ymd(new Date(opt.lastBackup)), today) : 999, hasData = S.weights.length + Object.keys(S.days).length > 10;
+      if (hasData && ds >= 14) push('backup', 'info', ds > 365 ? 'Aún no has hecho copia de seguridad' : 'Hace ' + ds + ' días de tu última copia', 'Guarda una copia en Ajustes → Copia de seguridad (un toque).');
+    }
+    var dis = opt.dismissed || {};
+    return out.filter(function (a) { return dis[a.id] !== today; });
+  }
+
+  /* ---------- 3 y 7. Comidas guardadas y "qué como ahora" ---------- */
+  function slotOf(type) { return ['Desayuno', 'Comida', 'Merienda', 'Cena', 'Snack'].indexOf(type) >= 0 ? type : 'Snack'; }
+  function candidates(S, today) {
+    var map = {}, from = add(today, -120);
+    function put(name, it, kind, type, date, id) {
+      var key = String(name || '').toLowerCase().trim(); if (!key || !(it.k > 0)) return;
+      var c = map[key] || (map[key] = { name: name, n: 0, k: 0, p: 0, c: 0, f: 0, items: it.items || null, slots: {}, last: '', kind: kind, id: id });
+      c.n++; c.k += it.k; c.p += num(it.p); c.c += num(it.c); c.f += num(it.f);
+      c.slots[slotOf(type)] = (c.slots[slotOf(type)] || 0) + 1;
+      if (date && date > c.last) { c.last = date; if (it.items) c.items = it.items; }
+      if (kind === 'fav') { c.kind = 'fav'; c.id = id; }
+    }
+    Object.keys(S.days).forEach(function (d) {
+      if (d < from || d >= today) return;
+      ((S.days[d] || {}).meals || []).forEach(function (m) { if (m.items && m.items.length) put(m.name, m, 'hist', m.type, d, m.id); });
+    });
+    (S.favs || []).forEach(function (f) { put(f.name, f, 'fav', null, '', f.id); var c = map[String(f.name).toLowerCase().trim()]; if (c) { c.n += 1; c.items = f.items || c.items; } });
+    return Object.keys(map).map(function (k) { var c = map[k]; return { name: c.name, k: c.k / c.n, p: c.p / c.n, c: c.c / c.n, f: c.f / c.n, n: c.n, items: c.items, slots: c.slots, last: c.last, kind: c.kind, id: c.id }; });
+  }
+  function mealsLeft(nowMin) { return nowMin < 11 * 60 ? 3 : nowMin < 16 * 60 ? 2 : 1; }
+  function nextMeal(S, T, di, today, nowMin, topN) {
+    if (!T) return { list: [] };
+    var rem = { k: T.kcal - di.intake, p: T.protein - di.p, c: T.carbs - di.c, f: T.fat - di.f }, left = mealsLeft(nowMin);
+    var slot = nowMin < 11 * 60 ? 'Desayuno' : nowMin < 16 * 60 ? 'Comida' : nowMin < 19 * 60 ? 'Merienda' : 'Cena';
+    var tgt = { k: Math.max(rem.k, 0) / left, p: Math.max(rem.p, 0) / left };
+    var out = { rem: rem, tgt: tgt, slot: slot, left: left, list: [], over: rem.k < 80 };
+    if (out.over) return out;
+    var scales = [0.5, 0.75, 1, 1.25, 1.5];
+    var eatenToday = {}; ((S.days[today] || {}).meals || []).forEach(function (m) { eatenToday[String(m.name).toLowerCase().trim()] = 1; });
+    var list = [];
+    candidates(S, today).forEach(function (c) {
+      if (eatenToday[c.name.toLowerCase().trim()] && c.n < 4) return;
+      var best = null;
+      scales.forEach(function (s) {
+        var k = c.k * s, p = c.p * s; if (k > rem.k * 1.02 + 20) return;
+        var ek = Math.abs(k - tgt.k) / Math.max(tgt.k, 150), ep = p >= tgt.p ? 0.25 * (p - tgt.p) / Math.max(tgt.p, 20) : (tgt.p - p) / Math.max(tgt.p, 20);
+        var pen = ek * 1.0 + ep * 1.4 + Math.abs(Math.log(s)) * 0.12;
+        if (c.p * s > 0 && k > 0 && (p * 4) / k < 0.15) pen += 0.2;               // muy poca proteína por kcal
+        if (!best || pen < best.pen) best = { s: s, k: k, p: p, c: c.c * s, f: c.f * s, pen: pen };
+      });
+      if (!best) return;
+      var slotBonus = (c.slots[slot] || 0) / Math.max(c.n, 1) * 0.35 - ((c.kind !== 'fav' && !c.slots[slot]) ? 0.25 : 0), freq = Math.min(Math.log(1 + c.n) / 8, 0.3), fav = c.kind === 'fav' ? 0.1 : 0;
+      var score = -best.pen + slotBonus + freq + fav;
+      list.push({ name: c.name, items: c.items, id: c.id, kind: c.kind, n: c.n, scale: best.s, k: best.k, p: best.p, c: best.c, f: best.f, score: score, type: slot });
+    });
+    list.sort(function (a, b) { return b.score - a.score; });
+    out.list = list.slice(0, topN || 5);
+    return out;
+  }
+  // Escala los alimentos de una comida y devuelve los items listos para guardar
+  function scaleItems(items, s) {
+    return (items || []).map(function (i) { return { n: i.n, g: Math.round((i.g || 0) * s), k: Math.round(i.k * s), p: r1(i.p * s), c: r1(i.c * s), f: r1(i.f * s), conf: i.conf }; });
+  }
+
+  /* ---------- 9. Resumen semanal ---------- */
+  function weekStats(S, ctx, T, start, end) {
+    var days = [], f = ctx;
+    for (var d = start; d <= end; d = add(d, 1)) days.push(C.dayInfo(S, d, f));
+    var lg = days.filter(function (x) { return x.logged; }), st = { start: start, end: end, logged: lg.length };
+    st.kcal = lg.length ? mean(lg.map(function (x) { return x.intake; })) : null;
+    st.protein = lg.length ? mean(lg.map(function (x) { return x.p; })) : null;
+    st.protDays = T ? lg.filter(function (x) { return x.p >= 0.9 * T.protein; }).length : 0;
+    st.tdee = lg.length ? mean(lg.map(function (x) { return x.tdee; })) : null;
+    st.balance = lg.length ? mean(lg.map(function (x) { return x.balance; })) : null;
+    var workouts = 0, gym = 0, sets = 0, steps = [], dayN = 0;
+    for (var d2 = start; d2 <= end; d2 = add(d2, 1)) {
+      var dd = S.days[d2] || {}; var ws = dd.workouts || [];
+      workouts += ws.length; ws.forEach(function (w) { if (w.gym) { gym++; sets += w.gym.sets || 0; } });
+      if (dd.health && dd.health.steps > 0) steps.push(dd.health.steps);
+    }
+    st.workouts = workouts; st.gym = gym; st.sets = sets; st.steps = steps.length ? mean(steps) : null;
+    var a = trendAt(ctx, add(start, -1)), b = trendAt(ctx, end);
+    st.dKg = a != null && b != null ? b - a : null;
+    if (T && lg.length) {                                                   // mejor y peor día respecto al objetivo
+      var sc = lg.map(function (x) { return { d: x.date, e: Math.abs(x.intake - T.kcal) / T.kcal + (x.p < 0.9 * T.protein ? 0.1 : 0), k: x.intake }; }).sort(function (x, y) { return x.e - y.e; });
+      st.best = sc[0]; st.worst = sc[sc.length - 1];
+    }
+    return st;
+  }
+  function weekly(S, ctx, T, today) {
+    var end = add(today, -1), start = add(end, -6), cur = weekStats(S, ctx, T, start, end), prev = weekStats(S, ctx, T, add(start, -7), add(start, -1));
+    var P = S.profile, rate = num(P.rate, 0.25), planned = P.goal === 'lose' ? -rate : P.goal === 'gain' ? rate : 0, focus = null;
+    var tr = trendInfo(S, ctx, today);
+    var did = [], fix = [];
+    if (cur.logged >= 6) did.push('Registraste ' + cur.logged + ' de 7 días: datos fiables.'); else fix.push('Solo registraste ' + cur.logged + ' de 7 días.');
+    if (T && cur.kcal != null) {
+      var dev = (cur.kcal - T.kcal) / T.kcal;
+      if (Math.abs(dev) <= 0.07) did.push('Media de ' + g3(cur.kcal) + ' kcal, a menos de un 7 % de tu objetivo (' + g3(T.kcal) + ').');
+      else fix.push('Media de ' + g3(cur.kcal) + ' kcal, ' + (dev > 0 ? 'por encima' : 'por debajo') + ' de tu objetivo (' + g3(T.kcal) + ').');
+      if (T.protein > 0 && cur.logged) { if (cur.protDays >= Math.ceil(cur.logged * 0.7)) did.push('Proteína alcanzada ' + cur.protDays + ' de ' + cur.logged + ' días.'); else fix.push('Proteína alcanzada solo ' + cur.protDays + ' de ' + cur.logged + ' días (media ' + Math.round(cur.protein) + ' g).'); }
+    }
+    if (cur.gym > 0) did.push(cur.gym + ' entreno(s) de fuerza, ' + cur.sets + ' series.'); else if (cur.workouts === 0) fix.push('Ningún entrenamiento registrado.');
+    // Una sola recomendación, por prioridad
+    if (cur.logged < 5) focus = 'Esta semana, registra al menos 5 días (mejor 7). Sin datos completos no puedo ajustar tu gasto real.';
+    else if (T && cur.logged && cur.protDays < Math.ceil(cur.logged * 0.5) && T.protein > 0) focus = 'Sube la proteína: añade ~' + Math.round(Math.max(20, T.protein - cur.protein)) + ' g al día (p. ej. 1 ración extra de pollo, atún, yogur griego o un batido).';
+    else if (T && cur.kcal != null && Math.abs((cur.kcal - T.kcal) / T.kcal) > 0.1) focus = 'Acércate a tu objetivo de ' + g3(T.kcal) + ' kcal: ahora vas ' + (cur.kcal > T.kcal ? 'unas ' + Math.round(cur.kcal - T.kcal) + ' por encima' : 'unas ' + Math.round(T.kcal - cur.kcal) + ' por debajo') + ' de media.';
+    else if (tr.rate14 != null && P.goal !== 'maintain' && Math.abs(tr.rate14 - planned) > 0.25 && cur.logged >= 5) {
+      var adj = Math.round((planned - tr.rate14) * KCAL_KG / 7 / 50) * 50;
+      focus = 'Tu peso se mueve a ' + r2(tr.rate14) + ' kg/sem y tu plan era ' + r2(planned) + '. Ajusta ' + (adj > 0 ? '+' : '') + adj + ' kcal al día durante 2 semanas y reevalúa.';
+    } else if (cur.gym === 0 && cur.workouts < 2) focus = 'Planifica 2–3 sesiones de fuerza: es lo que protege el músculo mientras ajustas el peso.';
+    else focus = 'Mantén lo que haces: va bien. Solo repite la semana con la misma constancia.';
+    return { cur: cur, prev: prev, did: did, fix: fix, focus: focus };
+  }
+
+  /* ---------- 11. Correlaciones (con prudencia estadística) ---------- */
+  function ranks(a) {
+    var idx = a.map(function (v, i) { return { v: v, i: i }; }).sort(function (x, y) { return x.v - y.v; }), r = new Array(a.length), i = 0;
+    while (i < idx.length) { var j = i; while (j + 1 < idx.length && idx[j + 1].v === idx[i].v) j++; var rk = (i + j) / 2 + 1; for (var k = i; k <= j; k++) r[idx[k].i] = rk; i = j + 1; }
+    return r;
+  }
+  function pearson(x, y) {
+    var n = x.length, mx = mean(x), my = mean(y), sxy = 0, sxx = 0, syy = 0;
+    for (var i = 0; i < n; i++) { sxy += (x[i] - mx) * (y[i] - my); sxx += (x[i] - mx) * (x[i] - mx); syy += (y[i] - my) * (y[i] - my); }
+    return sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : 0;
+  }
+  function spearman(x, y) { return pearson(ranks(x), ranks(y)); }
+  var TCRIT = { 8: 2.31, 10: 2.23, 12: 2.18, 15: 2.13, 20: 2.09, 30: 2.04, 60: 2.0, 1e9: 1.98 };
+  function tcrit(df) { var ks = Object.keys(TCRIT).map(Number).sort(function (a, b) { return a - b; }); for (var i = 0; i < ks.length; i++) if (df <= ks[i]) return TCRIT[ks[i]]; return 1.98; }
+  function sleepOf(day) { if (!day) return null; var s = num(day.sleep, 0) || (day.health && num(day.health.sleep, 0)); return s > 0 ? s : null; }
+  // Para cada día D con peso: residuo = peso(D) − tendencia previa. Factores = lo ocurrido el día D−1 (y el sueño de esa noche).
+  function correlations(S, ctx, today, nDays) {
+    nDays = nDays || 90; var rows = [], from = add(today, -nDays), prevT = null, f = noCalib(ctx);
+    var byDate = {}; ctx.trend.forEach(function (t) { byDate[t.d] = t; });
+    var lastT = null;
+    ctx.trend.forEach(function (t) {
+      var d = t.d, before = lastT; lastT = t;
+      if (d < from || d > today || !before || diff(before.d, d) > 2) return;
+      var y = add(d, -1), di = C.dayInfo(S, y, f), dayY = S.days[y] || {};
+      if (!di.logged) return;
+      var meals = dayY.meals || [], last = 0; meals.forEach(function (m) { var tm = C.toMin(m.t); if (tm != null && tm > last) last = tm; });
+      var dow = C.parseYmd(y).getDay(), gymY = (dayY.workouts || []).some(function (w) { return w.gym || w.type === 'pesas'; });
+      var dOn = S.days[d] || {};
+      rows.push({ res: t.raw - before.t, carbs: di.c, kcalBal: di.balance, prot: di.p, steps: dayY.health && dayY.health.steps > 0 ? dayY.health.steps : null,
+        sleep: sleepOf(dOn), lastMeal: last > 0 ? last : null, weekend: (dow === 5 || dow === 6) ? 1 : 0, train: gymY ? 1 : 0, kcal: di.intake });
+    });
+    var defs = [
+      ['carbs', 'Carbohidratos del día anterior', 'g', 'Más carbohidratos retienen más agua (cada gramo arrastra ~3 g de agua): un pico de peso al día siguiente no es grasa.'],
+      ['kcalBal', 'Balance calórico del día anterior', 'kcal', 'Es lo esperable: comer por encima de tu gasto sube la báscula.'],
+      ['steps', 'Pasos del día anterior', 'pasos', 'Más actividad suele bajar el peso del día siguiente.'],
+      ['sleep', 'Horas de sueño de esa noche', 'h', 'Dormir poco suele subir el peso (agua, cortisol) y el apetito.'],
+      ['lastMeal', 'Hora de la última comida', 'min', 'Cenas tardías pueden coincidir con más ingesta y más retención.'],
+      ['weekend', 'Día anterior en viernes/sábado', '', 'Los fines de semana suelen cambiar comidas y sodio.'],
+      ['train', 'Entreno de fuerza el día anterior', '', 'Tras entrenar fuerte, los músculos retienen agua y glucógeno unos días.']
+    ];
+    var out = [];
+    defs.forEach(function (d) {
+      var pts = rows.filter(function (r) { return r[d[0]] != null; });
+      var x = pts.map(function (r) { return r[d[0]]; }), y = pts.map(function (r) { return r.res; });
+      var uniq = {}; x.forEach(function (v) { uniq[v] = 1; });
+      var item = { key: d[0], label: d[1], unit: d[2], why: d[3], n: pts.length, r: null, sig: false };
+      if (pts.length >= 12 && Object.keys(uniq).length >= 2) {
+        var r = spearman(x, y), t = r * Math.sqrt((pts.length - 2) / Math.max(1e-9, 1 - r * r));
+        item.r = r; item.t = t; item.sig = Math.abs(t) >= tcrit(pts.length - 2) && Math.abs(r) >= 0.25;
+        if (d[0] === 'weekend' || d[0] === 'train') {                       // efecto en kg entre grupos
+          var a = pts.filter(function (p) { return p[d[0]] === 1; }).map(function (p) { return p.res; }), b = pts.filter(function (p) { return p[d[0]] === 0; }).map(function (p) { return p.res; });
+          if (a.length >= 4 && b.length >= 4) item.effect = mean(a) - mean(b);
+        } else {
+          var slope = pearson(x, y) * Math.sqrt(mean(y.map(function (v) { return v * v; })) - Math.pow(mean(y), 2)) / Math.sqrt(Math.max(1e-9, mean(x.map(function (v) { return v * v; })) - Math.pow(mean(x), 2)));
+          item.slope = slope;
+        }
+      }
+      out.push(item);
+    });
+    // sueño ↔ apetito (ingesta del día siguiente)
+    var sp = []; for (var d0 = from; d0 <= today; d0 = add(d0, 1)) { var s = sleepOf(S.days[d0]), di2 = C.dayInfo(S, d0, f); if (s && di2.logged) sp.push([s, di2.intake]); }
+    var hunger = null;
+    if (sp.length >= 12) { var rr = spearman(sp.map(function (a) { return a[0]; }), sp.map(function (a) { return a[1]; })), tt = rr * Math.sqrt((sp.length - 2) / Math.max(1e-9, 1 - rr * rr)); hunger = { n: sp.length, r: rr, sig: Math.abs(tt) >= tcrit(sp.length - 2) && Math.abs(rr) >= 0.25 }; }
+    return { n: rows.length, items: out, hunger: hunger, hasSleep: rows.some(function (r) { return r.sleep != null; }) };
+  }
+
+  var API = { trendInfo: trendInfo, forecast: forecast, weekRows: weekRows, learn: learn, alerts: alerts, candidates: candidates, nextMeal: nextMeal, scaleItems: scaleItems,
+    weekly: weekly, weekStats: weekStats, correlations: correlations, spearman: spearman, pearson: pearson, mealsLeft: mealsLeft, DAY_ADAPT: DAY_ADAPT, trendAt: trendAt };
+  if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.CO = API;
 })(typeof window !== 'undefined' ? window : this);
 
 </script>
@@ -1586,6 +1943,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (!S.profile.done) h += '<div class="banner"><b>Empieza aquí:</b> rellena tu perfil (edad, altura, peso y objetivo) para que los cálculos sean precisos.<br><button class="sm primary" data-act="tab" data-t="ajustes" style="margin-top:8px">Ir a mi perfil</button></div>';
     else if (aiMode() === 'none' && AI.ready !== false && BUILD === 'web') h += '<div class="banner"><b>IA no disponible.</b> ' + (CFG.ok ? 'Falta una clave de IA en Vercel.' : 'Esta app necesita el servidor de Vercel con sus variables de entorno.') + ' Mientras tanto puedes añadir comidas a mano.</div>';
 
+    h += cAlerts(T, ctx);
     var remaining = T.kcal - di.intake, over = remaining < 0;
     h += '<div class="card hero"><div class="ringwrap">' + ringSvg(di.intake / T.kcal, over) + '<div class="ringc"><b>' + fmt(Math.abs(remaining)) + '</b><span>' + (over ? 'kcal de más' : 'kcal restantes') + '</span></div></div>' +
       '<div class="stats"><div class="stat"><span class="muted">Objetivo</span><b>' + fmt(T.kcal) + '</b></div><div class="stat"><span class="muted">Comido</span><b>' + fmt(di.intake) + '</b></div><div class="stat"><span class="muted">Ejercicio</span><b>' + fmt(di.exercise * di.calib) + '</b></div></div></div>';
@@ -1607,6 +1965,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     h += '<div class="card"><div class="macro">' + macroCol('Proteína', di.p, tp, 'var(--s1)') + macroCol('Hidratos', di.c, T.carbs, 'var(--s2)') + macroCol('Grasa', di.f, T.fat, 'var(--s3)') + '</div>' +
       '<div class="tiny muted" style="margin-top:10px">Proteína objetivo: ' + f1(T.ppk) + ' g/kg · ' + fmt(T.protein) + ' g/día' + (macroK ? ' · reparto ' + Math.round(di.p * 400 / macroK) + '/' + Math.round(di.c * 400 / macroK) + '/' + Math.round(di.f * 900 / macroK) + ' %' : '') + '</div></div>';
 
+    h += cNext(T, di);
     MEALS.forEach(function (mt) {
       var ms = day.meals.filter(function (m) { return mealSlot(m.type) === mt[0]; });
       var kc = 0, pr = 0; ms.forEach(function (m) { kc += m.k; pr += m.p; });
@@ -1625,6 +1984,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     });
     hw.forEach(function (w) { h += '<div class="mrow" style="cursor:default"><div class="ico" style="font-size:20px">' + (SPORT_EMOJI[w.type] || '✨') + '</div><div class="nm"><b>' + esc(w.name || w.type) + ' <span class="badge">Salud</span></b><span>' + w.min + ' min</span></div><div class="kc">' + (w.kcal ? fmt(w.kcal) : '') + '<span>' + (w.kcal ? 'kcal' : '') + '</span></div></div>'; });
     h += '<button class="mrow" data-act="addwork" style="min-height:44px;color:var(--ink2);font-size:13.5px">⚡ Añadir deporte rápido (correr, fútbol…)</button></div>';
+    h += cSleep();
     if (day.health) h += '<div class="card small ink2">📱 Salud: <b>' + fmt(day.health.steps || 0) + '</b> pasos · <b>' + fmt(day.health.active || 0) + '</b> kcal activas</div>';
     return h;
   }
@@ -1826,6 +2186,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<div class="readout" id="wread">' + esc(V.readout) + '</div>' + weightChart(ctx) + '</div>';
 
     var sm7 = CC.summary(S, ctx, TODAY, 7), sm14 = CC.summary(S, ctx, TODAY, 14);
+    h += cWeekly(T, ctx) + cTrend(T, ctx);
     h += '<div class="card"><h2>Balance diario (14 días)</h2><div class="readout" id="bread"></div>' + balanceChart(ctx) + '</div>';
 
     h += '<div class="card"><h2>¿Adelgazo o engordo?</h2>';
@@ -1850,6 +2211,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     }
     h += '</div>';
 
+    h += cLearn(ctx) + cCorr(ctx);
     var M = CC.muscle(S, ctx, TODAY);
     h += '<div class="card"><h2>¿Me pongo fuerte?</h2>';
     if (!M.ok) h += '<p class="small ink2">Registra al menos 3 días de comidas para evaluar proteína y energía. Entrenos de fuerza en los últimos 7 días: <b>' + M.sessions + '</b>.</p>';
@@ -1929,10 +2291,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
     if (BUILD === 'web') h += '<div class="card"><h2>Instalar en el móvil</h2><ol class="small ink2" style="padding-left:20px;margin:0"><li>Abre esta web en <b>Safari</b> (iPhone) o Chrome (Android).</li><li>iPhone: botón <b>Compartir</b> → <b>Añadir a pantalla de inicio</b>. Android: menú ⋮ → <b>Instalar app</b>.</li><li>Ábrela desde el icono: funciona a pantalla completa, como una app.</li></ol></div>';
 
-    h += '<div class="card"><h2>Copia de seguridad</h2><div class="row"><button class="grow" data-act="export">Generar copia</button><button class="grow" data-act="importbk">Restaurar</button></div>' +
-      '<textarea id="bk" style="margin-top:8px" placeholder="Aquí aparece la copia (cópiala) o pega una para restaurar"></textarea><div class="small ' + (V.bmsg.indexOf('✓') === 0 ? 'good' : 'ink2') + '" id="bmsg" style="margin-top:4px">' + esc(V.bmsg) + '</div>' +
-      '<div class="tiny muted" id="syncst" style="margin-top:8px">' + esc(Store.status) + '</div>' +
-      '<button class="ghost danger full" style="margin-top:8px" data-act="wipe">' + (V.confirm === 'wipe' ? '¿Seguro? Pulsa otra vez para borrar todo' : 'Borrar todos mis datos') + '</button></div>';
+    h += '<div class="card"><h2>Mis rutinas de fuerza</h2>' + ((S.settings.routines || []).length ? S.settings.routines.map(function (r) { return '<div class="kv"><span>' + esc(r.name) + ' <span class="muted">· ' + r.exs.length + (r.exs.length === 1 ? ' ejercicio' : ' ejercicios') + '</span></span><button class="sm ghost danger" data-act="delroutine" data-id="' + r.id + '" aria-label="Borrar">✕</button></div>'; }).join('') : '<div class="small muted">Al terminar un entreno, pulsa «Guardar como rutina».</div>') + '</div>';
+    h += cBackupHtml();
     return h;
   }
 
@@ -2109,7 +2469,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   /* ====================== ENTRENO DE FUERZA (interfaz) ====================== */
   var CG = window.CG;
   V.gym = lsGet('gymlive') || null;
-  V.gview = 'main'; V.gq = ''; V.gg = 'todos'; V.gpanel = ''; V.gconf = ''; V.gsum = null; V.gvid = null; V._gp = {};
+  V.gview = 'main'; V.gq = ''; V.gg = 'todos'; V.gpanel = ''; V.gconf = ''; V.gsum = null; V.gvid = null; V._gp = {}; V._gs = {};
   function gsave() { lsSet('gymlive', V.gym); }
   function gdel() { lsDel('gymlive'); }
   function gcustom() { return S.settings.custom || []; }
@@ -2126,9 +2486,11 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     for (var i = 0; i < n; i++) x.sets.push(gnewSet());
     return x;
   }
+  function gsug(id) { if (!(id in V._gs)) V._gs[id] = CG.suggest(S, id, gkg(), gcustom()); return V._gs[id]; }
+  function groutines() { return S.settings.routines || []; }
   function gstart(repeatWorkout) {
     if (V.gym) { openGym(); toast('Tienes un entreno en curso'); return; }
-    V._gp = {};
+    V._gp = {}; V._gs = {};
     V.gym = { id: uid(), date: V.date, start: Date.now(), retro: V.date !== TODAY, name: '', exs: [], rest: null };
     if (repeatWorkout) V.gym.exs = (repeatWorkout.gym.exs || []).map(function (x) { return gnewEx(x.ex); });
     gsave(); V.gview = repeatWorkout ? 'main' : 'pick'; openGym();
@@ -2136,7 +2498,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function openGym() {
     if (!V.gym) return;
     if (V.gview !== 'pick' && V.gview !== 'sum') V.gview = 'main';
-    V._gp = {}; openSheet('gym'); gwake(true);
+    V._gp = {}; V._gs = {}; openSheet('gym'); gwake(true);
   }
   var _wl = null;
   function gwake(on) {
@@ -2188,6 +2550,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var e = gex(x.ex), h = '<div class="card gx"><div class="row sp" style="align-items:flex-start"><div class="grow"><b style="font-size:16px">' + esc(e.n) + '</b><div class="tiny muted">' + esc(CG.GROUPS[e.g] || '') + (e.o.uni ? ' · peso por mancuerna' : '') + (e.o.bw ? ' · peso corporal' + (e.k === 'bw' ? ' + lastre' : '') : '') + '</div></div>' +
       '<button class="sm ghost danger" data-act="gxdel" data-x="' + xi + '" aria-label="Quitar ejercicio">' + (V.gconf === 'x' + xi ? '¿Quitar?' : '✕') + '</button></div>';
     if (CG.isCardio(e)) return h + gcardioHtml(x, xi, e) + '</div>';
+    var sg = gsug(x.ex);
+    if (sg) h += '<div class="gsug small" style="background:var(--card2,rgba(120,140,100,.12));border-radius:10px;padding:8px 10px;margin:8px 0">🎯 <b>' + (sg.kind === 'subir' ? 'Toca subir' : sg.kind === 'bajar' ? 'Toca bajar' : 'Objetivo') + ':</b> ' + esc(sg.msg) + (sg.kind !== 'mantener' || sg.w > 0 ? ' <button class="sm" data-act="gapplysug" data-x="' + xi + '" style="margin-left:4px">Poner ' + gnum(sg.w) + ' kg</button>' : '') + '</div>';
     h += '<div class="gs gh"><span>Serie</span><span>Anterior</span>' + (e.k === 't' ? '<span class="gw2">Segundos</span>' : '<span>' + gunit(e) + '</span><span>Reps</span>') + '<span></span></div>';
     x.sets.forEach(function (s, si) { h += gsetRow(x, xi, si); });
     return h + '<div class="row" style="margin-top:8px"><button class="sm grow" data-act="gaddset" data-x="' + xi + '">+ Serie</button>' + (x.sets.length > 1 ? '<button class="sm ghost" data-act="gdelset" data-x="' + xi + '">− Quitar última</button>' : '') + '</div></div>';
@@ -2226,6 +2590,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
   function gpickHtml() {
     var h = '<div class="sheetin"><div class="stop"><button class="ghost" data-act="gback">Atrás</button><h1 style="font-size:20px;flex:1;text-align:center">Ejercicios</h1><span style="min-width:64px"></span></div>';
+    if (!V.gym.exs.length && groutines().length) h += '<div class="card"><h2>Tus rutinas</h2><div class="chips">' + groutines().map(function (r) { return '<span class="chip" data-act="groutine" data-id="' + r.id + '">' + esc(r.name) + ' · ' + r.exs.length + '</span>'; }).join('') + '</div><div class="tiny muted" style="margin-top:6px">Con un toque cargo los ejercicios y te propongo los kilos de hoy.</div></div>';
     h += '<div class="field"><input data-bind="gyq" type="search" placeholder="Buscar: press, remo, sentadilla…" value="' + esc(V.gq) + '" autocomplete="off"></div>';
     h += '<div class="chips" style="margin-bottom:12px;flex-wrap:nowrap;overflow-x:auto;padding-bottom:4px"><span class="chip' + (V.gg === 'todos' ? ' on' : '') + '" data-act="ggrp" data-v="todos">Todos</span>' + CG.GROUP_ORDER.map(function (g) { return '<span class="chip' + (V.gg === g ? ' on' : '') + '" data-act="ggrp" data-v="' + g + '">' + CG.GROUPS[g] + '</span>'; }).join('') + '</div>';
     h += '<div class="row" style="margin-bottom:8px"><button class="sm grow" data-act="geqp">⚙️ Mi equipamiento</button><button class="sm grow" data-act="gnewp">＋ Crear ejercicio</button></div>';
@@ -2277,6 +2642,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     h += '<div class="card"><div class="muted small" style="text-align:center">Calorías quemadas (estimación neta)</div><div class="bignum" id="gsk">' + fmt(CC.num(m.over) > 0 ? CC.num(m.over) : e.kcal) + '</div><div class="tiny muted" style="text-align:center">Incluye ≈ ' + fmt(e.post + e.epoc) + ' kcal de efecto posterior · rango probable ' + fmt(e.lo) + '–' + fmt(e.hi) + ' kcal · calculado para ' + f1(kg) + ' kg, sin contar el reposo</div>' +
       '<div class="grid3" style="margin-top:14px;text-align:center"><div><div class="mid">' + fmt(e.min) + '</div><div class="tiny muted">minutos</div></div><div><div class="mid">' + fmt(e.sets) + '</div><div class="tiny muted">series</div></div><div><div class="mid">' + fmt(e.vol) + '</div><div class="tiny muted">kg movidos</div></div></div></div>';
     var un = gunmarked(); if (un && !g.retro) h += '<div class="card small warn">Hay ' + un + ' serie(s) con datos pero sin ✓: no cuentan. Vuelve atrás para marcarlas.</div>';
+    h += '<div class="card"><div class="row sp"><div><b>Guardar como rutina</b><div class="tiny muted">La próxima vez la empiezas con un toque</div></div><button class="sm" data-act="gsaveroutine">' + (m.rsaved ? '✓ Guardada' : 'Guardar') + '</button></div></div>';
     h += '<div class="card"><h2>Nombre del entreno</h2><input data-bind="gyname" value="' + esc(m.name) + '"></div>';
     h += '<div class="card"><h2>Por ejercicio</h2>';
     m.exs.forEach(function (x) { var k = gbyEx(e, x.ex); h += '<div class="kv"><div class="grow" style="min-width:0"><b>' + esc(gex(x.ex).n) + (m.prs[x.ex] ? ' <span class="badge" style="color:var(--accent);border-color:var(--accent)">🏆 PR</span>' : '') + '</b><div class="tiny muted">' + esc(gsetsText(x)) + '</div></div><div style="text-align:right"><b>' + fmt(k) + '</b><div class="tiny muted">kcal</div></div></div>'; });
@@ -2329,9 +2695,11 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     CG.GROUP_ORDER.forEach(function (g) {
       if (g === 'cardio' || g === 'cuerpo') return;
       var n = cur[g] || 0, p = prev[g] || 0, pct = Math.min(100, n / 20 * 100);
-      h += '<div class="row" style="margin:6px 0"><span class="small" style="width:78px">' + CG.GROUPS[g] + '</span><div class="meter grow" style="height:8px"><i style="width:' + pct + '%;background:' + (n >= 10 ? 'var(--s1)' : 'var(--s2)') + '"></i></div><span class="small" style="width:62px;text-align:right"><b>' + n + '</b> <span class="muted">(' + p + ')</span></span></div>';
+      h += '<div class="row" style="margin:6px 0"><span class="small" style="width:78px">' + CG.GROUPS[g] + '</span><div class="meter grow" style="height:8px"><i style="width:' + pct + '%;background:' + (CG.zoneOf(n).z === 'optimo' ? 'var(--s1)' : CG.zoneOf(n).z === 'alto' ? 'var(--warn,#c9822b)' : 'var(--s2)') + '"></i></div><span class="small" style="width:62px;text-align:right"><b>' + n + '</b> <span class="muted">(' + p + ')</span></span></div>';
     });
-    h += '<div class="tiny muted">Entre paréntesis, la semana anterior.</div>';
+    h += '<div class="tiny muted">Entre paréntesis, la semana anterior. Verde = zona óptima (10–20 series/semana por grupo, Schoenfeld 2017); menos de 6 solo mantiene; más de 20 pide cuidar el descanso.</div>';
+    var lowG = CG.GROUP_ORDER.filter(function (g) { return g !== 'cardio' && g !== 'cuerpo' && (cur[g] || 0) < 6 && (prev[g] || 0) + (cur[g] || 0) > 0; }).map(function (g) { return CG.GROUPS[g].toLowerCase(); });
+    if (lowG.length) h += '<div class="small ink2" style="margin-top:6px">💡 Te quedan flojos: ' + lowG.join(', ') + '.</div>';
     var rec = CG.records(S, function (d) { return ctxNow().weightAt(d); }), ids = Object.keys(rec).sort(function (a, b) { return rec[b].best - rec[a].best; }).slice(0, 5);
     if (ids.length) {
       h += '<h3>Mejores marcas (1RM estimado)</h3>';
@@ -2449,6 +2817,20 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       V.gym = null; V.gsum = null; V.gview = 'main'; gdel(); gwake(false); V.date = g.date; V.sheet = null; V.tab = 'hoy'; render(); window.scrollTo(0, 0);
       toast('Entreno guardado · ' + fmt(item.kcal) + ' kcal');
     },
+    gapplysug: function (t) {
+      var x = V.gym.exs[+t.dataset.x], sg = x && gsug(x.ex); if (!sg) return;
+      (x.sets || []).forEach(function (s) { if (s.ty !== 'w' && (s.w === '' || s.w == null)) s.w = sg.w; }); gsave(); renderSheet();
+    },
+    groutine: function (t) {
+      var r = groutines().filter(function (x) { return x.id === t.dataset.id; })[0]; if (!r || !V.gym) return;
+      V._gp = {}; V._gs = {}; V.gym.exs = r.exs.filter(function (id) { return !!gex(id); }).map(gnewEx); V.gym.name = r.name; gsave(); V.gview = 'main'; renderSheet();
+    },
+    gsaveroutine: function () {
+      var m = V.gsum; if (!m || !m.exs.length) return; var name = (m.name || '').trim() || CG.autoName(m.exs, gcustom()), ids = m.exs.map(function (x) { return x.ex; });
+      var list = (S.settings.routines || []).filter(function (r) { return r.name.toLowerCase() !== name.toLowerCase(); });
+      list.push({ id: uid(), name: name, exs: ids, u: Date.now() }); S.settings.routines = list; touchCore(); m.rsaved = true; renderSheet(); toast('Rutina «' + name + '» guardada');
+    },
+    delroutine: function (t) { S.settings.routines = (S.settings.routines || []).filter(function (r) { return r.id !== t.dataset.id; }); touchCore(); render(); },
     gview: function (t) { V.gvid = t.dataset.id; openSheet('gymview'); },
     grepeat: function (t) {
       var w = (S.days[V.date] || { workouts: [] }).workouts.filter(function (x) { return x.id === t.dataset.id; })[0]; if (!w) return;
@@ -2461,6 +2843,198 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   Object.keys(GYM_ACTIONS).forEach(function (k) { ACTIONS[k] = GYM_ACTIONS[k]; });
 
 
+  /* ====================== ENTRENADOR (interfaz) ====================== */
+  var CO = window.CO;
+  function cdate(d) { var p = d.split('-'); return +p[2] + '/' + +p[1] + '/' + p[0].slice(2); }
+  function cdis() { return lsGet('alertdis') || {}; }
+  function cks(n) { return (n > 0 ? '+' : '') + f2(n); }
+
+  /* ---- Hoy: alertas ---- */
+  function cAlerts(T, ctx) {
+    if (V.date !== TODAY) return '';
+    var list = CO.alerts(S, ctx, T, TODAY, nowMin(), { lastBackup: lsGet('lastbackup') || 0, dismissed: cdis() });
+    if (!list.length) return '';
+    return list.slice(0, 2).map(function (a) {
+      return '<div class="card ' + (a.lvl === 'warn' ? 'cwarn' : 'cinfo') + '" style="border-left:4px solid ' + (a.lvl === 'warn' ? 'var(--warn,#c9822b)' : 'var(--s2)') + '"><div class="row sp" style="align-items:flex-start"><div class="grow"><b>' + (a.lvl === 'warn' ? '⚠️ ' : '💡 ') + esc(a.t) + '</b><div class="small ink2" style="margin-top:4px">' + esc(a.d) + '</div></div><button class="sm ghost" data-act="calert" data-id="' + a.id + '" aria-label="Descartar">✕</button></div></div>';
+    }).join('');
+  }
+
+  /* ---- Hoy: qué como ahora + guardadas ---- */
+  function cNext(T, di) {
+    if (V.date !== TODAY) return '';
+    var nm = CO.nextMeal(S, T, di, TODAY, nowMin(), 4); V._cn = nm;
+    var h = '<div class="card"><h2 style="margin-bottom:2px">🍽️ Qué como ahora</h2>';
+    if (nm.over) return h + '<div class="small ink2" style="margin-top:6px">Ya has cubierto tu objetivo de hoy. Si aún tienes hambre, mejor algo ligero con proteína (yogur, claras, fruta).</div></div>';
+    h += '<div class="small ink2" style="margin:2px 0 10px">Te quedan <b>' + fmt(Math.max(0, nm.rem.k)) + '</b> kcal y <b>' + fmt(Math.max(0, nm.rem.p)) + '</b> g de proteína · ' + nm.left + (nm.left === 1 ? ' comida' : ' comidas') + ' por delante (≈ ' + fmt(nm.tgt.k) + ' kcal y ' + fmt(nm.tgt.p) + ' g cada una)</div>';
+    if (!nm.list.length) h += '<div class="small muted">Registra unas cuantas comidas y aprenderé las que sueles hacer para proponértelas aquí.</div>';
+    nm.list.forEach(function (c, i) {
+      h += '<div class="kv" style="align-items:center"><div class="grow" style="min-width:0"><b>' + esc(c.name) + '</b>' + (c.kind === 'fav' ? ' <span class="badge">⭐</span>' : '') + '<div class="tiny muted">' + fmt(c.k) + ' kcal · P ' + fmt(c.p) + ' g' + (c.scale !== 1 ? ' · ración ×' + String(c.scale).replace('.', ',') : '') + ' · la has hecho ' + c.n + (c.n === 1 ? ' vez' : ' veces') + '</div></div><button class="sm primary" data-act="cadd" data-i="' + i + '">Añadir</button></div>';
+    });
+    if (S.favs.length) h += '<h3 style="margin-top:12px">⭐ Guardadas (un toque)</h3><div class="chips">' + S.favs.map(function (f) { return '<span class="chip" data-act="addfav" data-id="' + f.id + '">' + esc(f.name) + ' · ' + fmt(f.k) + '</span>'; }).join('') + '</div>';
+    return h + '<div class="tiny muted" style="margin-top:8px">Sugerencias a partir de lo que ya comes, ajustando la ración a lo que te queda. Guarda tus combos con ⭐ al añadir una comida.</div></div>';
+  }
+
+  /* ---- Hoy: sueño ---- */
+  function cSleep() {
+    if (V.date !== TODAY) return '';
+    var d = S.days[TODAY], cur = d && d.sleep > 0 ? d.sleep : (d && d.health && d.health.sleep > 0 ? d.health.sleep : 0);
+    var h = '<div class="card"><div class="row sp"><b>😴 Sueño de anoche</b>' + (cur ? '<span class="small ink2">' + String(cur).replace('.', ',') + ' h</span>' : '') + '</div><div class="chips" style="margin-top:8px">';
+    [5, 6, 6.5, 7, 7.5, 8, 9].forEach(function (v) { h += '<span class="chip' + (cur === v ? ' on' : '') + '" data-act="csleep" data-v="' + v + '">' + String(v).replace('.', ',') + ' h</span>'; });
+    return h + '</div><div class="tiny muted" style="margin-top:6px">Con unas semanas de datos puedo ver cómo el sueño afecta a tu peso y a tu hambre.</div></div>';
+  }
+
+  /* ---- Progreso ---- */
+  function cWeekly(T, ctx) {
+    var w = CO.weekly(S, ctx, T, TODAY), c = w.cur, p = w.prev, h = '<div class="card"><h2>Resumen de la semana</h2><div class="tiny muted" style="margin:-4px 0 10px">' + cdate(c.start) + ' → ' + cdate(c.end) + '</div>';
+    if (!c.logged) return h + '<p class="small ink2">Aún no hay días registrados la semana pasada. Registra tus comidas y aquí verás cómo vas, con un único cambio recomendado.</p></div>';
+    function d(a, b, u, dec) { return b == null || a == null ? '' : '<div class="tiny ' + (a - b > 0 ? '' : '') + 'muted">' + (a - b >= 0 ? '+' : '') + (dec ? f1(a - b) : fmt(a - b)) + u + ' vs. anterior</div>'; }
+    h += '<div class="grid3" style="margin-bottom:10px"><div><div class="mid">' + fmt(c.kcal) + '</div><div class="muted tiny">kcal/día (obj. ' + fmt(T.kcal) + ')</div>' + d(c.kcal, p.kcal, '', 0) + '</div>' +
+      '<div><div class="mid">' + c.protDays + '/' + c.logged + '</div><div class="muted tiny">días con proteína</div></div>' +
+      '<div><div class="mid">' + (c.dKg != null ? sgn(c.dKg, 1) : '—') + '</div><div class="muted tiny">kg (tendencia)</div></div></div>';
+    h += '<ul class="small ink2" style="padding-left:18px;margin:6px 0">' + w.did.map(function (t) { return '<li>✅ ' + esc(t) + '</li>'; }).join('') + w.fix.map(function (t) { return '<li>🔸 ' + esc(t) + '</li>'; }).join('') + '</ul>';
+    if (c.best && c.worst && c.best.d !== c.worst.d) h += '<div class="tiny muted">Mejor día: ' + dmy(c.best.d) + ' (' + fmt(c.best.k) + ' kcal) · el más lejos del objetivo: ' + dmy(c.worst.d) + ' (' + fmt(c.worst.k) + ')</div>';
+    return h + '<div class="banner" style="margin:12px 0 0"><b>🎯 Tu único cambio esta semana:</b><br>' + esc(w.focus) + '</div></div>';
+  }
+  function cTrend(T, ctx) {
+    var tr = CO.trendInfo(S, ctx, TODAY), P = S.profile, h = '<div class="card"><h2>Tendencia y objetivo</h2>';
+    if (tr.n < 3 || tr.rate == null) return h + '<p class="small ink2">Con al menos 4 pesadas repartidas en 10 días calculo tu ritmo real en kg por semana (la tendencia quita el ruido del agua y la sal).</p>' + cGoalField(P) + '</div>';
+    h += '<div class="grid3" style="margin-bottom:8px"><div><div class="mid">' + f1(tr.now) + '</div><div class="muted tiny">kg (tendencia)</div></div><div><div class="mid ' + (tr.rate < 0 ? 'good' : tr.rate > 0 ? 'warn' : '') + '">' + cks(tr.rate) + '</div><div class="muted tiny">kg/semana (14 d)</div></div><div><div class="mid">' + (tr.rate28 != null ? cks(tr.rate28) : '—') + '</div><div class="muted tiny">kg/semana (28 d)</div></div></div>';
+    if (tr.noise) h += '<div class="small ink2">Tu peso oscila de un día a otro unos <b>±' + f1(tr.noise) + ' kg</b> por agua y digestión: una sola pesada no dice nada, la tendencia sí.</div>';
+    h += cGoalField(P);
+    var sm = CC.summary(S, ctx, TODAY, 14), intake = sm && sm.days >= 5 ? sm.intake : T.kcal, goal = P.goalKg > 30 ? P.goalKg : null;
+    var fNow = CO.forecast(tr.now, T.ref, intake, 52, goal), fPlan = CO.forecast(tr.now, T.ref, T.kcal, 52, goal);
+    function at(f, n) { return f.pts[n - 1] ? f1(f.pts[n - 1].kg) + ' kg' : '—'; }
+    h += '<h3 style="margin-top:12px">Previsión (el gasto baja ≈ ' + CO.DAY_ADAPT + ' kcal por kg perdido)</h3><table><tr><th></th><th>4 sem</th><th>8 sem</th><th>12 sem</th></tr>' +
+      '<tr><td>Con lo que comes (' + fmt(intake) + ')</td><td>' + at(fNow, 4) + '</td><td>' + at(fNow, 8) + '</td><td>' + at(fNow, 12) + '</td></tr>' +
+      '<tr><td>Con tu objetivo (' + fmt(T.kcal) + ')</td><td>' + at(fPlan, 4) + '</td><td>' + at(fPlan, 8) + '</td><td>' + at(fPlan, 12) + '</td></tr></table>';
+    if (goal) {
+      function eta(f) { return f.reachDays ? 'hacia el <b>' + cdate(CC.addDays(TODAY, f.reachDays)) + '</b> (≈ ' + Math.ceil(f.reachDays / 7) + ' semanas)' : 'no la alcanzas a ese ritmo'; }
+      h += '<div class="small ink2" style="margin-top:8px">🎯 ' + f1(goal) + ' kg · con lo que comes ahora: ' + eta(fNow) + ' · con tu objetivo: ' + eta(fPlan) + '.</div>';
+    }
+    return h + '</div>';
+  }
+  function cGoalField(P) {
+    return '<div class="field" style="margin:10px 0 0"><label>Peso objetivo (kg, opcional)</label><input type="number" inputmode="decimal" step="0.1" data-bind="cggoal" value="' + (P.goalKg > 0 ? P.goalKg : '') + '" placeholder="Ej: 72"></div>';
+  }
+  function cLearn(ctx) {
+    var L = CO.learn(S, ctx, TODAY, 8), h = '<div class="card"><h2>Predicción vs realidad</h2>';
+    if (!L.n) return h + '<p class="small ink2">Cada semana comparo lo que <b>esperaba</b> que cambiara tu peso (según lo que comiste y tu gasto) con lo que <b>pasó de verdad</b>, y aprendo de la diferencia. Necesito semanas con ≥ 4 días registrados y 2 pesadas.</p></div>';
+    h += '<div class="small ink2" style="margin-bottom:8px">' + (L.ready ? 'Tu gasto real medido es <b>≈ ' + fmt(L.realTdee) + ' kcal/día</b> frente a ' + fmt(L.formula) + ' de la fórmula (' + sgn(L.gap) + '). ' : 'Llevo ' + L.n + ' semana(s) válidas; con 3 empiezo a fiarme. ') + 'La app ya usa este aprendizaje en tus balances diarios cuando la confianza lo permite.</div>';
+    h += '<table><tr><th>Semana</th><th>Esperado</th><th>Real</th><th>Error</th></tr>';
+    L.rows.filter(function (r) { return r.ok; }).slice(0, 6).forEach(function (r) {
+      var exp = r.predLearned != null ? r.predLearned : r.predFormula, er = r.predLearned != null ? r.errLearned : r.errFormula;
+      h += '<tr><td>' + dmy(r.start) + '</td><td>' + cks(exp) + ' kg</td><td>' + cks(r.actual) + ' kg</td><td class="' + (Math.abs(er) <= 0.25 ? 'good' : 'warn') + '">' + cks(er) + '</td></tr>';
+    });
+    h += '</table>';
+    if (L.ready && L.maeLearned != null) h += '<div class="small ink2" style="margin-top:8px">Error medio por semana: <b>' + f2(L.maeFormula) + ' kg</b> con la fórmula → <b>' + f2(L.maeLearned) + ' kg</b> con lo aprendido de ti. Dirección acertada: ' + L.dirOk + '/' + L.dirN + ' semanas.</div>';
+    return h + '<div class="tiny muted" style="margin-top:6px">«Esperado» solo usa datos anteriores a cada semana. El peso es la tendencia (sin ruido de agua). Confianza ' + L.conf + '.</div></div>';
+  }
+  function cCorr(ctx) {
+    var R = CO.correlations(S, ctx, TODAY, 90), h = '<div class="card"><h2>¿Qué influye en tu peso?</h2>';
+    if (R.n < 14) return h + '<p class="small ink2">Necesito ~2 semanas de comidas y pesadas seguidas para buscar patrones (tengo ' + R.n + ' días útiles). Aviso: son correlaciones, no pruebas de causa.</p></div>';
+    var sig = R.items.filter(function (i) { return i.sig; });
+    function txt(i) {
+      var s = '';
+      if (i.effect != null) s = (i.effect >= 0 ? '+' : '') + f2(i.effect) + ' kg al día siguiente';
+      else if (i.slope != null) { var k = { carbs: [100, 'por cada 100 g'], kcalBal: [500, 'por cada 500 kcal'], steps: [5000, 'por cada 5.000 pasos'], sleep: [1, 'por cada hora'], lastMeal: [60, 'por cada hora más tarde'] }[i.key] || [1, '']; s = cks(i.slope * k[0]) + ' kg ' + k[1]; }
+      return '<div class="kv"><div class="grow"><b>' + esc(i.label) + '</b><div class="tiny muted">' + esc(i.why) + '</div></div><div style="text-align:right"><b>' + s + '</b><div class="tiny muted">ρ ' + f2(i.r) + ' · ' + i.n + ' días</div></div></div>';
+    }
+    h += sig.length ? sig.map(txt).join('') : '<p class="small ink2">Con tus ' + R.n + ' días no veo todavía ninguna relación clara: buena señal, tu peso responde sobre todo a las calorías.</p>';
+    if (R.hunger && R.hunger.sig) h += '<div class="small ink2" style="margin-top:8px">😴 Cuando duermes ' + (R.hunger.r < 0 ? 'menos' : 'más') + ', comes ' + (R.hunger.r < 0 ? 'más' : 'menos') + ' ese día (ρ ' + f2(R.hunger.r) + ').</div>';
+    var rest = R.items.filter(function (i) { return !i.sig && i.r !== null; });
+    if (rest.length) h += '<div class="tiny muted" style="margin-top:8px">Sin relación clara aún: ' + rest.map(function (i) { return esc(i.label.toLowerCase()); }).join(', ') + '.</div>';
+    if (!R.hasSleep) h += '<div class="tiny muted" style="margin-top:6px">Apunta tu sueño en Hoy para incluirlo en el análisis.</div>';
+    return h + '<div class="tiny muted" style="margin-top:6px">Correlación de Spearman con el peso de cada mañana frente a su tendencia; solo muestro lo estadísticamente sólido (p ≈ 0,05). Correlación no es causa.</div></div>';
+  }
+  function cProgress(T, ctx) { return cWeekly(T, ctx) + cTrend(T, ctx) + cLearn(ctx) + cCorr(ctx); }
+
+  /* ---- Copia de seguridad ---- */
+  function backupObj() { return { v: 2, app: 'calorias', at: new Date().toISOString(), profile: S.profile, weights: S.weights, favs: S.favs, settings: S.settings, days: S.days, gone: S.gone, memory: S.memory }; }
+  function backupName() { return 'calorias-' + TODAY + '.json'; }
+  function backupDo(mode) {
+    var txt = JSON.stringify(backupObj()), name = backupName();
+    function done(m) { lsSet('lastbackup', Date.now()); V.bmsg = '✓ ' + m; render(); }
+    try {
+      var file = new File([txt], name, { type: 'application/json' });
+      if (mode === 'share' && navigator.canShare && navigator.canShare({ files: [file] })) { navigator.share({ files: [file], title: 'Copia de Mis calorías' }).then(function () { done('Copia compartida.'); }, function () {}); return; }
+    } catch (e) {}
+    var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([txt], { type: 'application/json' })); a.download = name; document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1500); done('Copia descargada (' + name + ').');
+  }
+  // Fusiona una copia con lo que hay (nunca borra): lo más nuevo gana por elemento
+  function backupMerge(o) {
+    var before = { w: S.weights.length, m: 0, k: 0 };
+    Object.keys(S.days).forEach(function (d) { before.m += ((S.days[d] || {}).meals || []).length; });
+    var core = mergeCore({ profile: S.profile, weights: S.weights, favs: S.favs, settings: S.settings, u: 1 }, { profile: o.profile, weights: o.weights || [], favs: o.favs || [], settings: o.settings || {}, u: 0 });
+    var st = Object.assign({}, o.settings || {}, S.settings || {});
+    ['routines', 'custom'].forEach(function (k) { var m = {}, out = []; ((S.settings || {})[k] || []).concat((o.settings || {})[k] || []).forEach(function (x) { if (x && x.id && !m[x.id]) { m[x.id] = 1; out.push(x); } }); if (out.length) st[k] = out; });
+    S.weights = core.weights; S.favs = core.favs; S.settings = Object.assign(defaultState().settings, st); if (core.profile) S.profile = Object.assign(defaultState().profile, core.profile);
+    var months = {};
+    Object.keys(o.days || {}).forEach(function (d) { months[monthKey(d)] = 1; });
+    Object.keys(months).forEach(function (mk) {
+      var pre = mk.slice(2), a = { days: {}, gone: {} }, b = { days: {}, gone: o.gone || {} };
+      Object.keys(S.days).forEach(function (d) { if (d.slice(0, 7) === pre) a.days[d] = S.days[d]; });
+      Object.keys(S.gone || {}).forEach(function (g) { if (g.slice(0, 7) === pre) a.gone[g] = S.gone[g]; });
+      Object.keys(o.days).forEach(function (d) { if (d.slice(0, 7) === pre) b.days[d] = o.days[d]; });
+      var m = mergeMonth(a, b);
+      Object.keys(m.days).forEach(function (d) { S.days[d] = m.days[d]; });
+      S.gone = S.gone || {}; Object.keys(m.gone).forEach(function (g) { S.gone[g] = Math.max(S.gone[g] || 0, m.gone[g]); });
+      touch(mk);
+    });
+    touchCore();
+    var after = { m: 0 }; Object.keys(S.days).forEach(function (d) { after.m += ((S.days[d] || {}).meals || []).length; });
+    return { weights: S.weights.length - before.w, meals: after.m - before.m };
+  }
+  function backupRestore(txt) {
+    var o; try { o = JSON.parse(txt); } catch (e) { return { err: 'Ese archivo no es una copia válida.' }; }
+    if (!o || !o.profile || typeof o.days !== 'object') return { err: 'Esa copia no es válida.' };
+    lsSet('prebackup', backupObj());                          // red de seguridad: estado anterior a restaurar
+    return backupMerge(o);
+  }
+
+  var COACH_ACTIONS = {
+    calert: function (t) { var m = cdis(); m[t.dataset.id] = TODAY; lsSet('alertdis', m); render(); },
+    csleep: function (t) { var d = dayOf(TODAY, true), v = +t.dataset.v; d.sleep = d.sleep === v ? 0 : v; touchDay(TODAY); render(); },
+    cadd: function (t) {
+      var c = V._cn && V._cn.list[+t.dataset.i]; if (!c) return;
+      var items = c.items && c.items.length ? CO.scaleItems(c.items, c.scale) : [{ n: c.name, g: 0, k: Math.round(c.k), p: CC.round(c.p, 1), c: CC.round(c.c, 1), f: CC.round(c.f, 1), conf: 'media' }];
+      var tt = totalsOf(items), day = dayOf(TODAY, true);
+      day.meals.push({ id: uid(), t: nowHM(), type: c.type, name: c.name, k: Math.round(tt.k), p: CC.round(tt.p, 1), c: CC.round(tt.c, 1), f: CC.round(tt.f, 1), items: items, u: Date.now() });
+      touchDay(TODAY); render(); toast('Añadido · ' + fmt(tt.k) + ' kcal');
+    },
+    bkshare: function () { backupDo('share'); },
+    bkfile: function () { backupDo('file'); },
+    bkcopy: function () {
+      var txt = JSON.stringify(backupObj()); try { navigator.clipboard.writeText(txt).then(function () { lsSet('lastbackup', Date.now()); V.bmsg = '✓ Copia en el portapapeles.'; render(); }, function () { V.bmsg = 'No pude copiar; usa «Guardar archivo».'; render(); }); } catch (e) { V.bmsg = 'No pude copiar; usa «Guardar archivo».'; render(); }
+    },
+    bkpick: function () { var el = $('#bkfile'); if (el) el.click(); },
+    bkundo: function () {
+      var p = lsGet('prebackup'); if (!p) return; var r = backupMerge(p); V.bmsg = '✓ Vuelto a la copia previa (solo añade lo que faltaba).'; render();
+    }
+  };
+  Object.keys(COACH_ACTIONS).forEach(function (k) { ACTIONS[k] = COACH_ACTIONS[k]; });
+  function cInput(t) {
+    var b = t.dataset.bind;
+    if (b === 'cggoal') { var v = CC.num(t.value); S.profile.goalKg = v > 30 && v < 250 ? v : null; touchCore(); if (V.tab === 'progreso') { var y = window.scrollY; render(); window.scrollTo(0, y); } }
+    else if (b === 'cgbkfile') {
+      var f = t.files && t.files[0]; if (!f) return; var rd = new FileReader();
+      rd.onload = function () { var r = backupRestore(String(rd.result)); V.bmsg = r.err ? r.err : '✓ Copia fusionada con tus datos (+' + r.meals + ' comidas, +' + r.weights + ' pesadas). Nada se ha borrado.'; render(); };
+      rd.readAsText(f); t.value = '';
+    }
+  }
+  function cBackupHtml() {
+    var lb = lsGet('lastbackup'), ds = lb ? CC.diffDays(CC.ymd(new Date(lb)), TODAY) : null;
+    return '<div class="card"><h2>Copia de seguridad</h2><div class="small ' + (ds == null || ds >= 14 ? 'warn' : 'ink2') + '" style="margin-bottom:8px">' + (ds == null ? 'Aún no has hecho ninguna copia.' : ds === 0 ? 'Última copia: hoy.' : 'Última copia: hace ' + ds + (ds === 1 ? ' día.' : ' días.')) + '</div>' +
+      '<div class="row"><button class="grow primary" data-act="bkshare">Guardar / compartir</button><button class="grow" data-act="bkfile">Descargar archivo</button></div>' +
+      '<div class="row" style="margin-top:8px"><button class="grow" data-act="bkpick">Restaurar desde archivo</button><button class="grow ghost" data-act="bkcopy">Copiar texto</button></div>' +
+      '<input id="bkfile" data-bind="cgbkfile" type="file" accept="application/json,.json" style="display:none">' +
+      (lsGet('prebackup') ? '<button class="sm ghost" style="margin-top:8px" data-act="bkundo">Volver a como estaba antes de restaurar</button>' : '') + '<div class="tiny muted" style="margin-top:6px">Restaurar <b>fusiona</b> la copia con tus datos actuales (lo más reciente de cada comida/pesada gana) y nunca borra nada.' + '' + '</div>' +
+      '<div class="small ' + (V.bmsg.indexOf('✓') === 0 ? 'good' : 'ink2') + '" id="bmsg" style="margin-top:6px">' + esc(V.bmsg) + '</div>' +
+      '<div class="tiny muted" id="syncst" style="margin-top:8px">' + esc(Store.status) + '</div>' +
+      '<button class="ghost danger full" style="margin-top:8px" data-act="wipe">' + (V.confirm === 'wipe' ? '¿Seguro? Pulsa otra vez para borrar todo' : 'Borrar todos mis datos') + '</button></div>';
+  }
+
+
   document.addEventListener('click', function (e) {
     var t = e.target.closest('[data-act]');
     if (!t) { if (V.sheet === 'menu' && e.target.id === 'sheet') closeSheet(); return; }
@@ -2470,6 +3044,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   document.addEventListener('input', function (e) {
     var t = e.target, b = t.dataset && t.dataset.bind; if (!b) return;
     if (b.indexOf('gy') === 0) { gInput(t); return; }
+    if (b.indexOf('cg') === 0) return;
     var d = V.draft;
     if (b === 'desc') d.desc = t.value;
     else if (b === 'name') { d.name = t.value; d.nameEdited = true; }
@@ -2491,6 +3066,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     }
     if (!b) return;
     if (b.indexOf('gy') === 0) { gInput(t); return; }
+    if (b.indexOf('cg') === 0) { cInput(t); return; }
     if (b === 'jump') { if (t.value && t.value <= TODAY) { V.date = t.value; render(); } }
     else if (b === 'date') V.draft.date = t.value || TODAY;
     else if (b === 't') V.draft.t = t.value || '';
@@ -2515,6 +3091,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function importHealth(txt, atMin) {
     var r = CC.parseHealth(txt, TODAY), day = dayOf(r.date, true);
     day.health = { steps: r.steps, active: r.active, resting: r.resting, workouts: r.workouts, ts: Date.now() };
+    if (r.sleep > 0) { day.health.sleep = r.sleep; }
     if (r.date === TODAY) { var nw = new Date(); day.health.at = atMin != null ? atMin : nw.getHours() * 60 + nw.getMinutes(); }
     if (r.weight >= 30 && r.weight <= 300) addWeight(r.date, r.weight, false);
     touchDay(r.date);
