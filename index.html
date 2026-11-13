@@ -707,6 +707,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   E('bw_squat', 'Sentadilla (peso corporal)', 'pierna', ['pc'], 'L', 'bw', { bw: 0.7 });
   E('calf', 'Elevación de gemelos de pie', 'pierna', ['barra'], 'S');
   E('calf_db', 'Elevación de gemelos (mancuerna)', 'pierna', ['manc'], 'S', 'wr', { uni: 1 });
+  E('calf_bw', 'Elevación de gemelos (peso corporal)', 'pierna', ['pc'], 'S', 'bw', { bw: 1 });
   E('calf_seated', 'Elevación de gemelos sentado (barra)', 'pierna', ['barra', 'banco'], 'S');
   E('wall_sit', 'Sentadilla isométrica en pared', 'pierna', ['pc'], 'M', 't', { met: 3.8 });
   // Glúteos
@@ -777,31 +778,64 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
   function restDefault(e) { return e.m === 'L' ? 150 : e.m === 'M' ? 105 : 75; }
 
-  /* ---------- Modelo de calorías ----------
-     kcal netas = Σ (MET del tramo − 1) · kg · horas   (el 1 MET de reposo ya está en el gasto basal)
-     · Serie: tiempo bajo tensión = reps × 3,5 s (isométricos: segundos reales), MET de trabajo según la masa muscular
-       (grande 9,5 · media 7 · pequeña 5), con ajustes por calentamiento/fallo/repeticiones.
-     · Descanso: el consumo de oxígeno sigue alto tras la serie y decae: MET medio = 2,4 + 2,8·(τ/t)(1−e^(−t/τ)), τ = 50 s.
-       Entre 8 y 20 min se cuenta casi como parado y una pausa de más de 20 min no cuenta.
-     · EPOC (consumo posterior) ≈ +5 % de la parte de fuerza.
-     · Cinta: ecuaciones ACSM (caminar/correr + pendiente). Bici: potencia si la hay (rendimiento 24 %), si no MET por intensidad. */
-  var WORK_MET = { L: 9.5, M: 7.0, S: 5.0 };
-  var TEMPO = 3.5, REST_INF = 2.4, REST_A = 2.8, REST_TAU = 50, REST_MAX = 480, EPOC = 0.05;
-  function restMET(t) { t = Math.max(10, t); return REST_INF + REST_A * (REST_TAU / t) * (1 - Math.exp(-t / REST_TAU)); }
-  function restNet(sec, kg) {                      // kcal netas de un descanso de `sec` segundos
-    if (sec <= 0) return 0;
-    var a = Math.min(sec, REST_MAX), b = Math.min(Math.max(0, sec - REST_MAX), 720);   // 8–20 min: casi parado; más de 20 min = pausa, no cuenta
-    return ((restMET(a) - 1) * a + 0.3 * b) * kg / 3600;
+  /* ---------- Modelo de calorías (basado en trabajo mecánico) ----------
+     Fuentes: el gasto de una serie sube de forma lineal con el trabajo externo (kg·m), r = 0,91–0,95 (Byrd 1996/98; Reis 2017);
+     el coste de bajar la carga añade ≈ 14 % (Hunter 1991); en series al fallo con pecho al 70 % 1RM salen ≈ 7–9 kcal por serie
+     (Scott 2011); piernas gastan ≈ el doble que brazos; flexiones ≈ 0,77 kcal/rep y sentadilla con peso corporal ≈ 0,50 kcal/rep
+     (J Strength Cond Res 2021); recuperar la energía anaeróbica ocurre en el descanso, por eso NO se suma aparte.
+     Serie:  kcal = (carga externa + parte de tu peso que subes) · g · recorrido · reps · 1,14 · estabilización / eficiencia
+             (eficiencia efectiva ≈ 9,5 % tren superior y core · 14 % piernas y glúteos · 12,5 % gemelos)
+     Resto del tiempo (andar, quitar discos, descansar de pie): 0,9 MET netos.  EPOC: +6 % de lo levantado.
+     Isométricos y cardio: MET. Cinta: ACSM. Bici: vatios (rendimiento 24 %) o MET por intensidad. Siempre neto de reposo. */
+  var G = 9.81, ECC = 1.14, LIGHT_NET = 0.9, EPOC = 0.06, REST_MAX = 480, TEMPO = 3.5;
+  var ALPHA = { up: 10.5, low: 7.1, calf: 8.0 };
+  // [recorrido de la carga (m), fracción de tu peso que subes, estabilización]
+  var DEF = { pecho: [0.42, 0.02, 1.05], espalda: [0.45, 0.04, 1.08], hombro: [0.5, 0.03, 1.08], biceps: [0.45, 0.03, 1.0], triceps: [0.4, 0.03, 1.0],
+    pierna: [0.5, 0.65, 1.05], gluteo: [0.35, 0.4, 1.0], core: [0.3, 0.2, 1.0], cuerpo: [0.7, 0.4, 1.1], cardio: [0.5, 0.5, 1.0] };
+  var OVR = {
+    bench_inc: [0.40, 0.02, 1.05], bench_dec: [0.38, 0.02, 1.05], floor_press: [0.25, 0.02, 1.05], db_bench: [0.45, 0.02, 1.15], db_inc: [0.43, 0.02, 1.15],
+    db_fly: [0.45, 0.02, 1.15], db_fly_inc: [0.43, 0.02, 1.15], cable_fly: [0.5, 0.02, 1.1],
+    pushup: [0.40, 0.64, 1.3], pushup_inc: [0.40, 0.5, 1.2], pushup_dec: [0.40, 0.74, 1.3], pushup_dia: [0.40, 0.64, 1.3], dips: [0.45, 0.95, 1.1],
+    pullup: [0.55, 1, 1.05], chinup: [0.55, 1, 1.05], pullup_n: [0.55, 1, 1.05], pullup_w: [0.55, 1, 1.05], row_inv: [0.35, 0.6, 1.05],
+    lat_pd: [0.55, 0, 1.0], lat_pd_n: [0.55, 0, 1.0], lat_pd_1: [0.55, 0, 1.0], row_cable: [0.45, 0, 1.0], row_cable_w: [0.45, 0, 1.0],
+    row_bar: [0.40, 0.10, 1.15], row_db: [0.40, 0.05, 1.1], row_cs: [0.35, 0, 1.0], row_tbar: [0.40, 0.1, 1.1], straight_arm: [0.6, 0, 1.0], pullover: [0.55, 0.02, 1.05],
+    shrug: [0.12, 0.02, 1.0], shrug_db: [0.12, 0.02, 1.0], deadlift: [0.55, 0.25, 1.1], rack_pull: [0.35, 0.2, 1.1], good_morning: [0.4, 0.35, 1.15],
+    ohp: [0.55, 0.03, 1.15], ohp_seated: [0.55, 0.03, 1.05], push_press: [0.6, 0.15, 1.15], db_ohp: [0.55, 0.03, 1.12], arnold: [0.6, 0.03, 1.12],
+    lateral: [0.5, 0.05, 1.0], lateral_cable: [0.5, 0.05, 1.0], front_raise: [0.5, 0.05, 1.0], rear_fly: [0.4, 0.04, 1.05], rear_cable: [0.4, 0, 1.0], face_pull: [0.4, 0, 1.0], upright: [0.4, 0.03, 1.0], pike: [0.35, 0.7, 1.2],
+    oh_cable: [0.4, 0, 1.0], skull: [0.4, 0.03, 1.05], bench_dips: [0.4, 0.55, 1.05],
+    squat: [0.55, 0.65, 1.1], front_squat: [0.55, 0.65, 1.12], goblet: [0.5, 0.65, 1.05], sumo_db: [0.45, 0.65, 1.05], bulgarian: [0.45, 0.7, 1.15], lunge: [0.45, 0.65, 1.1], lunge_bar: [0.45, 0.65, 1.12],
+    rev_lunge: [0.45, 0.65, 1.1], step_up: [0.4, 0.7, 1.05], rdl: [0.45, 0.3, 1.1], rdl_db: [0.45, 0.3, 1.1], sumo_dl: [0.45, 0.25, 1.1], stiff_leg: [0.45, 0.3, 1.2], nordic: [0.5, 0.55, 1.0],
+    jump_squat: [0.5, 0.8, 1.1], bw_squat: [0.5, 0.7, 1.05], calf: [0.09, 1, 1.0], calf_db: [0.09, 1, 1.0], calf_bw: [0.08, 1, 1.0], calf_seated: [0.08, 0.1, 1.0],
+    hip_thrust: [0.30, 0.45, 1.05], glute_bridge: [0.25, 0.4, 1.0], pull_through: [0.45, 0.3, 1.0], kick_cable: [0.35, 0, 1.0], abd_cable: [0.3, 0, 1.0],
+    hang_leg: [0.5, 0.32, 1.0], hang_knee: [0.35, 0.25, 1.0], cable_crunch: [0.35, 0, 1.0], situp: [0.4, 0.3, 1.0], crunch: [0.25, 0.2, 1.0], leg_raise: [0.45, 0.3, 1.0],
+    russian: [0.4, 0, 1.0], pallof: [0.3, 0, 1.0], woodchop: [0.8, 0, 1.0], dead_bug: [0.4, 0.1, 1.0],
+    clean: [0.8, 0.3, 1.2], thruster: [1.0, 0.65, 1.15], db_swing: [0.7, 0.2, 1.1], farmer: [0.15, 0.0, 1.0], db_thruster: [1.0, 0.65, 1.15]
+  };
+  var DB2 = { db_bench: 1, db_inc: 1, db_fly: 1, db_fly_inc: 1, db_ohp: 1, arnold: 1, lateral: 1, front_raise: 1, rear_fly: 1, shrug_db: 1, rdl_db: 1, farmer: 1, db_thruster: 1, lunge: 1, rev_lunge: 1, bulgarian: 1, step_up: 1 };
+  function phys(e) {
+    var d = OVR[e.id] || DEF[e.g] || DEF.cuerpo, bwf = e.o.bw != null ? e.o.bw : d[1];
+    var alpha = e.id.indexOf('calf') === 0 ? ALPHA.calf : (e.g === 'pierna' || e.g === 'gluteo' || e.g === 'cuerpo') ? ALPHA.low : ALPHA.up;
+    return { rom: d[0], bwf: bwf, stab: d[2], alpha: alpha };
   }
+  function pulleyF(e, opts) { return e.eq && e.eq.indexOf('polea') >= 0 && opts && opts.pulley > 0 ? opts.pulley : 1; }
   function tutOf(e, s) { return e.k === 't' ? Math.max(0, num(s.r)) : Math.max(0, num(s.r)) * TEMPO; }
-  function setMET(e, s) {
-    var met = e.o.met || WORK_MET[e.m] || 6.5;
-    if (s.ty === 'w') met *= 0.75; else if (s.ty === 'f') met *= 1.08;
-    var r = num(s.r);
-    if (e.k !== 't') met *= r <= 5 ? 1.04 : r > 20 ? 0.92 : r > 15 ? 0.96 : 1;
-    return Math.max(2, met);
+  // kcal netas de una serie (incluye lo que se "devuelve" después en el descanso)
+  function setKcal(e, s, kg, opts) {
+    var r = Math.max(0, num(s.r));
+    if (e.k === 't') {
+      var met = e.o.met || 3.3, k0 = Math.max(0, (met - 1) * kg * r / 3600);
+      return s.ty === 'w' ? k0 * 0.8 : k0;
+    }
+    var p = phys(e), ext = num(s.w) * (DB2[e.id] ? 2 : 1) * pulleyF(e, opts), load = ext + p.bwf * kg;
+    var k = load * G * p.rom * r * ECC * p.stab * p.alpha / 4184;
+    if (s.ty === 'f') k *= 1.08;
+    return Math.max(0, k);
   }
-  function workNet(e, s, kg) { var t = tutOf(e, s); return Math.max(0, (setMET(e, s) - 1) * kg * t / 3600); }
+  function lightNet(sec, kg) {                       // andar, quitar discos, descansar de pie
+    if (sec <= 0) return 0;
+    var a = Math.min(sec, REST_MAX), b = Math.min(Math.max(0, sec - REST_MAX), 720);   // 8–20 min: casi parado; > 20 min = pausa
+    return (LIGHT_NET * a + 0.3 * b) * kg / 3600;
+  }
 
   function treadmillKcal(min, speed, inc, kg) {
     var v = speed > 0 ? speed : 5, g = Math.max(0, Math.min(15, num(inc))) / 100, m = v * 1000 / 60;
@@ -843,9 +877,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
 
   // Estimación de la sesión. g = { start, end, retro, exs: [{ ex, sets:[{w,r,t,ty,done}] | min,speed,inc,watts,lvl,t }] }
-  function estimate(g, kg, custom) {
+  function estimate(g, kg, custom, opts) {
     kg = kg > 20 ? kg : 75;
-    var events = [], byEx = {}, strength = 0, cardio = 0, workSec = 0, restSec = 0, vol = 0, nsets = 0, nwork = 0;
+    var events = [], byEx = {}, lift = 0, light = 0, cardio = 0, workSec = 0, restSec = 0, vol = 0, nsets = 0, nwork = 0;
     function addEx(id, k) { byEx[id] = (byEx[id] || 0) + k; }
     (g.exs || []).forEach(function (x, xi) {
       var e = exOf(x.ex, custom);
@@ -867,30 +901,30 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
         if (first) { pre = Math.min(rest, 900); rest = Math.max(0, rest - pre); }
       } else rest = ev.cardio ? 0 : (ev.x && num(ev.x.rest) > 0 ? num(ev.x.rest) : restDefault(e));
       first = false;
-      var kc;
       if (ev.cardio) {
-        kc = cardioKcal(e, ev.x, kg); cardio += kc; addEx(e.id, kc);
-        if (live) { var rr = restNet(Math.min(rest, 120), kg); strength += rr; restSec += Math.min(rest, 120); addEx(e.id, rr); }
-        workSec += ev.d;
+        var kc = cardioKcal(e, ev.x, kg); cardio += kc; addEx(e.id, kc); workSec += ev.d;
+        if (live) { var rr = lightNet(Math.min(rest, 120), kg); light += rr; restSec += Math.min(rest, 120); addEx(e.id, rr); }
       } else {
-        var w = workNet(e, ev.s, kg), r = restNet(rest, kg);
-        if (pre > 0) { var pk = (2.8 - 1) * kg * pre / 3600; strength += pk; addEx(e.id, pk); restSec += pre; }
-        strength += w + r; addEx(e.id, w + r); workSec += ev.d; restSec += rest;
-        if (ev.s.ty !== 'w') { nwork++; if (e.k === 'wr') vol += num(ev.s.w) * num(ev.s.r); else if (e.k === 'bw') vol += num(ev.s.w) * num(ev.s.r); }
+        var w = setKcal(e, ev.s, kg, opts), r = lightNet(rest, kg), pk = pre > 0 ? lightNet(pre, kg) : 0;
+        lift += w; light += r + pk; addEx(e.id, w + r + pk); workSec += ev.d; restSec += rest + pre;
+        if (ev.s.ty !== 'w') { nwork++; if (e.k === 'wr' || e.k === 'bw') vol += num(ev.s.w) * num(ev.s.r); }
         nsets++;
       }
       lastEx = e;
     });
     if (live && g.end && events.length) {              // enfriamiento tras la última serie
-      var tail = Math.max(0, (g.end - prevT) / 1000), t1 = Math.min(tail, 300), t2 = Math.max(0, tail - 300);
-      var tk = ((2.4 - 1) * t1 + 0.3 * Math.min(t2, 600)) * kg / 3600; strength += tk; restSec += tail; if (lastEx) addEx(lastEx.id, tk);
+      var tail = Math.max(0, (g.end - prevT) / 1000), tk = lightNet(tail, kg); light += tk; restSec += tail; if (lastEx) addEx(lastEx.id, tk);
     }
-    var epoc = strength * EPOC, total = strength + cardio + epoc;
+    var epoc = lift * EPOC, total = lift + light + cardio + epoc;
     var spanMin = live && g.end ? (g.end - g.start) / 60000 : (workSec + restSec) / 60;
-    var bd = Object.keys(byEx).map(function (id) { return { ex: id, kcal: byEx[id] * (total / Math.max(1e-9, strength + cardio)) }; });
+    // Salvaguarda: ninguna sesión de fuerza razonable supera ~7 MET netos de media (evita erratas como 500 kg en vez de 50)
+    var cap = (7 * kg * spanMin / 60) + cardio;
+    if (spanMin > 0 && lift + light + epoc > cap - cardio) total = cap;
+    var base = Math.max(1e-9, lift + light + cardio), f = total / base;
+    var bd = Object.keys(byEx).map(function (id) { return { ex: id, kcal: byEx[id] * f }; });
     return {
-      kcal: Math.round(total), lo: Math.round(total * 0.82), hi: Math.round(total * 1.18),
-      strength: Math.round(strength), cardio: Math.round(cardio), epoc: Math.round(epoc),
+      kcal: Math.round(total), lo: Math.round(total * 0.75), hi: Math.round(total * 1.3),
+      lift: Math.round(lift * f), light: Math.round(light * f), cardio: Math.round(cardio * f), epoc: Math.round(epoc * f),
       min: Math.round(spanMin), workSec: Math.round(workSec), restSec: Math.round(restSec),
       vol: Math.round(vol), sets: nwork, allSets: nsets, byEx: bd, live: !!live
     };
@@ -963,7 +997,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   var API = {
     EQ: EQ, EQ_OFF: EQ_OFF, GROUPS: GROUPS, GROUP_ORDER: GROUP_ORDER, CAT: CAT, LEVELS: LEVELS, BIKE_LEVELS: BIKE_LEVELS,
     exOf: exOf, isCardio: isCardio, available: available, catalog: catalog, search: search, restDefault: restDefault,
-    restMET: restMET, treadmillKcal: treadmillKcal, bikeKcal: bikeKcal, minKcal: minKcal, estimate: estimate,
+    setKcal: setKcal, phys: phys, treadmillKcal: treadmillKcal, bikeKcal: bikeKcal, minKcal: minKcal, estimate: estimate,
     validSet: validSet, effLoad: effLoad, e1rm: e1rm, gymWorkouts: gymWorkouts, workingSets: workingSets,
     lastPerf: lastPerf, records: records, weeklySets: weeklySets, autoName: autoName, TEMPO: TEMPO
   };
@@ -2102,7 +2136,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var g = V.gym;
     return { start: g.start, end: end || Date.now(), retro: g.retro, exs: g.exs };
   }
-  function gest() { return CG.estimate(gcopy(), gkg(), gcustom()); }
+  function gopts() { var p = CC.num(S.settings.pulley); return { pulley: p > 0 ? p : 1 }; }
+  function gest() { return CG.estimate(gcopy(), gkg(), gcustom(), gopts()); }
 
   /* ---- Vista principal ---- */
   function gunit(e) { return e.k === 'bw' ? '+kg' : 'kg'; }
@@ -2133,7 +2168,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       var labs = e.k === 'bici' ? CG.BIKE_LEVELS : CG.LEVELS;
       h += '<div class="seg2" style="margin-bottom:10px">' + labs.map(function (l, i) { return '<button data-act="gclvl" data-x="' + xi + '" data-v="' + i + '" class="' + (x.lvl === i ? 'on' : '') + '">' + l + '</button>'; }).join('') + '</div>';
     }
-    var k = CC.num(x.min) > 0 ? CG.estimate({ retro: true, exs: [{ ex: x.ex, min: x.min, speed: x.speed, inc: x.inc, watts: x.watts, lvl: x.lvl }] }, gkg(), gcustom()).kcal : 0;
+    var k = CC.num(x.min) > 0 ? CG.estimate({ retro: true, exs: [{ ex: x.ex, min: x.min, speed: x.speed, inc: x.inc, watts: x.watts, lvl: x.lvl }] }, gkg(), gcustom(), gopts()).kcal : 0;
     return h + '<div class="row sp"><span class="small ink2">≈ <b>' + fmt(k) + '</b> kcal netas</span><button class="gdone' + (x.done ? ' on' : '') + '" data-act="gcdone" data-x="' + xi + '">' + (x.done ? '✓ Hecho' : 'Marcar hecho') + '</button></div></div>';
   }
   function gexCard(x, xi) {
@@ -2183,7 +2218,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     h += '<div class="row" style="margin-bottom:8px"><button class="sm grow" data-act="geqp">⚙️ Mi equipamiento</button><button class="sm grow" data-act="gnewp">＋ Crear ejercicio</button></div>';
     if (V.gpanel === 'eq') {
       var off = Object.assign({}, CG.EQ_OFF, S.settings.equipOff || {});
-      h += '<div class="card"><h2>Lo que tengo</h2><div class="chips">' + Object.keys(CG.EQ).map(function (k) { return '<span class="chip' + (off[k] ? '' : ' on') + '" data-act="geq" data-v="' + k + '">' + esc(CG.EQ[k]) + '</span>'; }).join('') + '</div><div class="tiny muted" style="margin-top:8px">Solo verás ejercicios que puedas hacer con lo marcado.</div></div>';
+      h += '<div class="card"><h2>Lo que tengo</h2><div class="chips">' + Object.keys(CG.EQ).map(function (k) { return '<span class="chip' + (off[k] ? '' : ' on') + '" data-act="geq" data-v="' + k + '">' + esc(CG.EQ[k]) + '</span>'; }).join('') + '</div><h3>Tu polea (rack con discos)</h3><div class="seg2"><button data-act="gpul" data-v="1" class="' + (CC.num(S.settings.pulley) !== 0.5 ? 'on' : '') + '">1:1 · el peso es lo que tiras</button><button data-act="gpul" data-v="0.5" class="' + (CC.num(S.settings.pulley) === 0.5 ? 'on' : '') + '">2:1 · se nota la mitad</button></div><div class="tiny muted" style="margin-top:8px">Solo verás ejercicios que puedas hacer con lo marcado. Si al tirar de la polea notas la mitad del peso de los discos, usa 2:1 para que las kcal sean correctas.</div></div>';
     }
     if (V.gpanel === 'new') {
       h += '<div class="card"><h2>Nuevo ejercicio</h2><div class="field"><label>Nombre</label><input data-bind="gycn" id="gycn" placeholder="Ej: Press en máquina"></div><div class="grid3"><div class="field"><label>Grupo</label><select data-bind="gycg" id="gycg">' + CG.GROUP_ORDER.map(function (g) { return '<option value="' + g + '">' + CG.GROUPS[g] + '</option>'; }).join('') + '</select></div><div class="field"><label>Tipo</label><select data-bind="gyck" id="gyck"><option value="wr">Peso × reps</option><option value="bw">Peso corporal</option><option value="t">Tiempo</option></select></div><div class="field"><label>Músculo</label><select data-bind="gycm2" id="gycm2"><option value="L">Grande</option><option value="M" selected>Medio</option><option value="S">Pequeño</option></select></div></div><button class="primary full" data-act="gnewsave">Crear y añadir</button></div>';
@@ -2207,7 +2242,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     return n;
   }
   function gsummary() {
-    var g = V.gym, exs = gfinalExs(), end = Date.now(), kg = gkg(), est = CG.estimate({ start: g.start, end: end, retro: g.retro, exs: exs }, kg, gcustom());
+    var g = V.gym, exs = gfinalExs(), end = Date.now(), kg = gkg(), est = CG.estimate({ start: g.start, end: end, retro: g.retro, exs: exs }, kg, gcustom(), gopts());
     var rec = CG.records(S, function (d) { return ctxNow().weightAt(d); }), prs = {};
     exs.forEach(function (x) {
       var e = gex(x.ex); if (!x.sets || e.k === 't') return;
@@ -2235,9 +2270,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     h += '</div>';
     h += '<div class="card"><div class="field" style="margin:0"><label>¿Tu reloj marca otra cifra? Escríbela aquí (opcional)</label><input data-bind="gyover" type="number" inputmode="numeric" value="' + esc(m.over) + '" placeholder="' + fmt(e.kcal) + '"></div></div>';
     h += '<div class="card"><details><summary style="margin:0">Cómo se calcula</summary><div class="small ink2" style="margin-top:8px;line-height:1.5">' +
-      '<b>Fuerza:</b> cada serie dura (reps × 3,5 s) con un esfuerzo según la masa muscular implicada (piernas/espalda grandes, pecho/hombro medios, brazos pequeños). Entre series se cuenta el descanso <b>real</b> (lo que tardas entre un ✓ y el siguiente): el cuerpo sigue gastando más de lo normal y baja poco a poco. Se suma un 5 % por el consumo posterior al ejercicio.<br>' +
+      '<b>Fuerza:</b> cada serie se calcula con el <b>trabajo mecánico</b>: (peso que mueves + la parte de tu cuerpo que subes) × recorrido del ejercicio × repeticiones, con un 14 % más por bajar la carga y la eficiencia real del cuerpo (≈ 10 % en tren superior, 14 % en piernas). Por eso un press con más kilos, más reps o una sentadilla (que levanta también tu cuerpo) gastan más que unos curls. La energía que el músculo «devuelve» en el descanso ya está dentro de cada serie. El tiempo entre series cuenta como actividad ligera y se suma un 6 % de consumo posterior.<br>' +
       '<b>Cinta:</b> ecuaciones del ACSM con tu velocidad e inclinación. <b>Bici:</b> con vatios, la energía mecánica con un rendimiento del 24 %; sin vatios, por intensidad.<br>' +
-      '<b>Siempre neto:</b> se resta lo que ya gastas en reposo, que ya está en tu gasto del día. Es una estimación: el margen real es de ±15–20 %.</div></details></div>';
+'<b>Siempre neto:</b> se resta lo que ya gastas en reposo, que ya está en tu gasto del día. Es una estimación: el margen real es de −25 % a +30 %, y los relojes suelen dar más que los estudios de laboratorio.</div></details></div>';
     h += '</div><div class="sbar"><div><div class="tot"><b>' + fmt(CC.num(m.over) > 0 ? CC.num(m.over) : e.kcal) + ' kcal</b><span>' + esc(m.name) + '</span></div><button class="primary" data-act="gsave">Guardar entreno</button></div></div>';
     return h;
   }
@@ -2246,7 +2281,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function gviewHtml() {
     var day = S.days[V.date], w = day && day.workouts.filter(function (x) { return x.id === V.gvid; })[0];
     if (!w || !w.gym) return '<div class="sheetin"><div class="stop"><button class="ghost" data-act="closesheet">Cerrar</button><h1>Entreno</h1><span style="min-width:64px"></span></div></div>';
-    var gg = w.gym, est = CG.estimate({ start: gg.start, end: gg.end, retro: gg.retro, exs: gg.exs }, ctxNow().weightAt(V.date), gcustom());
+    var gg = w.gym, est = CG.estimate({ start: gg.start, end: gg.end, retro: gg.retro, exs: gg.exs }, ctxNow().weightAt(V.date), gcustom(), gopts());
     var h = '<div class="sheetin"><div class="stop"><button class="ghost" data-act="closesheet">Cerrar</button><h1 style="font-size:20px;flex:1;text-align:center">' + esc(w.name || 'Entreno') + '</h1><span style="min-width:64px"></span></div>' +
       '<div class="card"><div class="muted small" style="text-align:center">' + esc(shortDate(V.date)) + '</div><div class="bignum">' + fmt(w.kcal) + '</div><div class="tiny muted" style="text-align:center">kcal netas' + (gg.model && gg.model !== w.kcal ? ' (tú) · el modelo daba ' + fmt(gg.model) : '') + '</div>' +
       '<div class="grid3" style="margin-top:14px;text-align:center"><div><div class="mid">' + fmt(w.min) + '</div><div class="tiny muted">minutos</div></div><div><div class="mid">' + fmt(gg.sets || 0) + '</div><div class="tiny muted">series</div></div><div><div class="mid">' + fmt(gg.vol || 0) + '</div><div class="tiny muted">kg movidos</div></div></div></div><div class="card"><h2>Ejercicios</h2>';
@@ -2347,6 +2382,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       var off = Object.assign({}, S.settings.equipOff || {}), k = t.dataset.v, cur = Object.assign({}, CG.EQ_OFF, off)[k];
       off[k] = !cur; S.settings.equipOff = off; touchCore(); renderSheet();
     },
+    gpul: function (t) { S.settings.pulley = CC.num(t.dataset.v); touchCore(); renderSheet(); },
     gnewsave: function () {
       var n = ($('#gycn').value || '').trim(); if (!n) { toast('Ponle un nombre'); return; }
       var c = { id: 'c-' + uid(), n: n, g: $('#gycg').value, k: $('#gyck').value, m: $('#gycm2').value };
