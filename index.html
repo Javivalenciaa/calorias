@@ -573,7 +573,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   function defaultState() {
     return {
       profile: { sex: 'm', age: 21, height: 181, weight: 78, bodyFat: null, activity: 'lig', goal: 'maintain', rate: 0.25, proteinPerKg: null, done: false },
-      weights: [], days: {}, favs: [], settings: { healthHasWorkouts: false }, memory: { notes: [] }
+      weights: [], days: {}, gone: {}, favs: [], settings: { healthHasWorkouts: false }, memory: { notes: [] }
     };
   }
   var S = defaultState();
@@ -632,7 +632,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (key === 'core') return { profile: S.profile, weights: S.weights, favs: S.favs, settings: S.settings, memory: S.memory };
     var prefix = key.slice(2), days = {};
     Object.keys(S.days).forEach(function (d) { if (d.slice(0, 7) === prefix) days[d] = S.days[d]; });
-    return { days: days };
+    var gone = {}; Object.keys(S.gone || {}).forEach(function (g) { if (g.slice(0, 7) === prefix) gone[g] = S.gone[g]; });
+    return { days: days, gone: gone };
   }
   function applyDoc(key, d) {
     if (key === 'core') {
@@ -644,6 +645,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       var prefix = key.slice(2);
       Object.keys(S.days).forEach(function (k) { if (k.slice(0, 7) === prefix) delete S.days[k]; });
       Object.keys(d.days).forEach(function (k) { S.days[k] = d.days[k]; });
+      S.gone = S.gone || {}; Object.keys(S.gone).forEach(function (g) { if (g.slice(0, 7) === prefix) delete S.gone[g]; });
+      Object.keys(d.gone || {}).forEach(function (g) { S.gone[g] = d.gone[g]; });
     }
   }
   function loadLocal() {
@@ -722,12 +725,57 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     await Store.db.doc('data/users/' + Store.uid + '/' + k).set(doc);
   }
   function remoteOn() { return !!Store.kind && (Store.kind === 'supabase' || (Store.db && Store.uid)); }
+  /* Fusión sin pérdidas: nunca gana un documento entero, se combina comida a comida. */
+  function canon(o) { if (Array.isArray(o)) return o.map(canon); if (o && typeof o === 'object') { var r = {}; Object.keys(o).sort().forEach(function (k) { if (k !== 'u') r[k] = canon(o[k]); }); return r; } return o; }
+  function same(a, b) { return JSON.stringify(canon(a)) === JSON.stringify(canon(b)); }
+  function pickNew(a, b) { return (b.u || 0) > (a.u || 0) ? b : a; }
+  function unionById(la, lb, date, gone) {
+    var m = {}, order = [];
+    (la || []).concat(lb || []).forEach(function (x) {
+      if (!x || !x.id || gone[date + '|' + x.id]) return;
+      if (!m[x.id]) { m[x.id] = x; order.push(x.id); } else m[x.id] = pickNew(m[x.id], x);
+    });
+    return order.map(function (id) { return m[id]; });
+  }
+  function mergeMonth(a, b) {
+    a = a || { days: {}, gone: {} }; b = b || { days: {}, gone: {} };
+    var gone = {};
+    [a.gone || {}, b.gone || {}].forEach(function (g) { Object.keys(g).forEach(function (k) { gone[k] = Math.max(gone[k] || 0, g[k] || 0); }); });
+    var days = {}, ad = a.days || {}, bd = b.days || {};
+    Object.keys(ad).concat(Object.keys(bd)).forEach(function (date) {
+      if (days[date]) return;
+      var x = ad[date] || {}, y = bd[date] || {}, o = {};
+      Object.keys(x).concat(Object.keys(y)).forEach(function (k) { if (k !== 'meals' && k !== 'workouts' && k !== 'health') o[k] = y[k] !== undefined && x[k] === undefined ? y[k] : (x[k] !== undefined ? x[k] : y[k]); });
+      o.meals = unionById(x.meals, y.meals, date, gone);
+      o.workouts = unionById(x.workouts, y.workouts, date, gone);
+      var h = x.health && y.health ? ((y.health.ts || 0) > (x.health.ts || 0) ? y.health : x.health) : (x.health || y.health);
+      if (h && (gone[date + '|health'] || 0) < (h.ts || 1)) o.health = h;
+      days[date] = o;
+    });
+    return { days: days, gone: gone };
+  }
+  function mergeCore(loc, r) {
+    var newer = pickNew(loc, r), older = newer === loc ? r : loc, out = Object.assign({}, older, newer);
+    if (loc.profile && r.profile && loc.profile.done !== r.profile.done) out.profile = loc.profile.done ? loc.profile : r.profile;
+    var w = {}; (older.weights || []).concat(newer.weights || []).forEach(function (x) { w[x.d] = x; });
+    out.weights = Object.keys(w).sort().map(function (d) { return w[d]; });
+    var f = {}, fo = []; (newer.favs || []).concat(older.favs || []).forEach(function (x) { if (x && x.id && !f[x.id]) { f[x.id] = 1; fo.push(x); } });
+    out.favs = fo; out.u = Math.max(loc.u || 0, r.u || 0);
+    return out;
+  }
   function mergeRemote(remote) {
     var changed = false;
     Object.keys(remote).forEach(function (k) {
-      var loc = lsGet(k), r = remote[k];
-      if (!loc || (r.u || 0) > (loc.u || 0)) { applyDoc(k, r); lsSet(k, r); changed = true; if (k !== 'core') { var ms = lsGet('months') || []; if (ms.indexOf(k) < 0) { ms.push(k); lsSet('months', ms); } } }
-      else if ((loc.u || 0) > (r.u || 0)) Store.pending[k] = loc;
+      var loc = lsGet(k), r = remote[k], merged;
+      if (!loc) { merged = r; }
+      else if (k === 'core') merged = mergeCore(loc, r);
+      else { merged = mergeMonth(loc, r); merged.u = Math.max(loc.u || 0, r.u || 0); }
+      var diffRemote = !same(merged, r), diffLocal = !same(merged, loc || {});
+      if (diffRemote) merged.u = Date.now();
+      if (diffLocal || !loc) { applyDoc(k, merged); changed = true; }
+      lsSet(k, merged);
+      if (k !== 'core') { var ms = lsGet('months') || []; if (ms.indexOf(k) < 0) { ms.push(k); lsSet('months', ms); } }
+      if (diffRemote) Store.pending[k] = merged;
     });
     (['core'].concat(lsGet('months') || [])).forEach(function (k) { if (!remote[k] && lsGet(k)) Store.pending[k] = lsGet(k); });
     return changed;
@@ -754,6 +802,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (!remoteOn()) return;
     try {
       var changed = mergeRemote(await remoteGetAll());
+      Store.pulled = true;
+      if (applyPendingImport()) changed = true;
       Store.status = stLabel(); await flush();
       if (changed && !V.sheet) render();
     } catch (e) { Store.status = 'Sin sincronizar: ' + sbErr(e); if (!quiet) SB.msg = Store.status; var el = $('#syncst'); if (el) el.textContent = Store.status; }
@@ -1480,7 +1530,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       openMeal(null, d);
     },
     delmealsheet: function () {
-      var d = V.draft, day = dayOf(d.date); if (day) { day.meals = day.meals.filter(function (m) { return m.id !== d.id; }); touchDay(d.date); }
+      var d = V.draft, day = dayOf(d.date); if (day) { day.meals = day.meals.filter(function (m) { return m.id !== d.id; }); S.gone[d.date + '|' + d.id] = Date.now(); touchDay(d.date); }
       closeSheet(); render(); toast('Comida borrada');
     },
     settype: function (t) { V.draft.type = t.dataset.t; renderDraft(); },
@@ -1516,7 +1566,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       if (d.id) { meal = day.meals.filter(function (m) { return m.id === d.id; })[0]; }
       if (!meal) { meal = { id: uid(), t: nowHM() }; day.meals.push(meal); }
       if (d.t) meal.t = d.t;
-      meal.type = d.type; meal.name = name; meal.k = Math.round(t.k); meal.p = CC.round(t.p, 1); meal.c = CC.round(t.c, 1); meal.f = CC.round(t.f, 1); meal.items = items;
+      meal.u = Date.now(); meal.type = d.type; meal.name = name; meal.k = Math.round(t.k); meal.p = CC.round(t.p, 1); meal.c = CC.round(t.c, 1); meal.f = CC.round(t.f, 1); meal.items = items;
       touchDay(d.date);
       if (d.fav) { S.favs.push({ id: uid(), name: name, k: meal.k, p: meal.p, items: items }); touchCore(); }
       V.date = d.date; V.sheet = null; V.draft = null; V.tab = 'hoy'; render(); window.scrollTo(0, 0); toast('Añadido · ' + fmt(meal.k) + ' kcal');
@@ -1529,10 +1579,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       var w = V.work, e = workEst(), min = CC.num(w.min);
       if (min <= 0) { toast('Indica los minutos'); return; }
       var kcal = CC.num(w.kcal) > 0 ? CC.num(w.kcal) : e.est;
-      dayOf(V.date, true).workouts.push({ id: uid(), type: w.type, int: w.int, min: Math.round(min), kcal: Math.round(kcal) });
+      dayOf(V.date, true).workouts.push({ id: uid(), u: Date.now(), type: w.type, int: w.int, min: Math.round(min), kcal: Math.round(kcal) });
       touchDay(V.date); V.sheet = null; V.tab = 'hoy'; render(); toast('Entreno añadido · ' + fmt(kcal) + ' kcal');
     },
-    delwork: function (t) { var day = dayOf(V.date); if (!day) return; day.workouts = day.workouts.filter(function (x) { return x.id !== t.dataset.id; }); touchDay(V.date); render(); },
+    delwork: function (t) { var day = dayOf(V.date); if (!day) return; day.workouts = day.workouts.filter(function (x) { return x.id !== t.dataset.id; }); S.gone[V.date + '|' + t.dataset.id] = Date.now(); touchDay(V.date); render(); },
     kgstep: function (t) { V.wt.kg = Math.round((CC.num(V.wt.kg) + CC.num(t.dataset.v)) * 10) / 10; $('#sheet').innerHTML = weightHtml(); },
     saveweight: function () {
       var w = V.wt, kg = CC.num(w.kg);
@@ -1571,7 +1621,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       try { V.hmsg = importHealth($('#hin').value); render(); }
       catch (e) { V.hmsg = 'No he podido leer esos datos: ' + (e.message || 'formato no válido'); var m = $('#hmsg'); if (m) { m.textContent = V.hmsg; m.className = 'small bad'; } }
     },
-    delhealth: function () { var dd = S.days[V.date]; if (dd && dd.health) { delete dd.health; touchDay(V.date); V.hmsg = ''; toast('Datos de Salud quitados'); render(); } },
+    delhealth: function () { var dd = S.days[V.date]; if (dd && dd.health) { delete dd.health; S.gone[V.date + '|health'] = Date.now(); touchDay(V.date); V.hmsg = ''; toast('Datos de Salud quitados'); render(); } },
     delfav: function (t) { S.favs = S.favs.filter(function (f) { return f.id !== t.dataset.id; }); touchCore(); render(); },
     export: function () {
       var o = { v: 1, profile: S.profile, weights: S.weights, favs: S.favs, settings: S.settings, days: S.days };
@@ -1644,23 +1694,36 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }, { passive: true });
 
   /* ====================== Arranque ====================== */
-  function importHealth(txt) {
+  function importHealth(txt, atMin) {
     var r = CC.parseHealth(txt, TODAY), day = dayOf(r.date, true);
-    day.health = { steps: r.steps, active: r.active, resting: r.resting, workouts: r.workouts };
-    if (r.date === TODAY) { var nw = new Date(); day.health.at = nw.getHours() * 60 + nw.getMinutes(); }
+    day.health = { steps: r.steps, active: r.active, resting: r.resting, workouts: r.workouts, ts: Date.now() };
+    if (r.date === TODAY) { var nw = new Date(); day.health.at = atMin != null ? atMin : nw.getHours() * 60 + nw.getMinutes(); }
     if (r.weight >= 30 && r.weight <= 300) addWeight(r.date, r.weight, false);
     touchDay(r.date);
     return '✓ Importado ' + dmy(r.date) + ': ' + fmt(r.steps) + ' pasos, ' + fmt(r.active) + ' kcal activas' + (r.weight ? ', peso ' + f1(r.weight) + ' kg' : '') + (r.workouts.length ? ', ' + r.workouts.length + ' entreno(s)' : '') + '.';
   }
   // El Atajo abre la app con los datos en la dirección: /?fecha=2026-11-11&pasos=8234&activas=412&reposo=1790
+  function applyPendingImport() {
+    var p = lsGet('pendimp'); if (!p) return false;
+    if (BUILD === 'web' && CFG.ok && !Store.pulled) return false;
+    lsDel('pendimp');
+    try {
+      var txt = p.lines; if (!/(^|\n)fecha=/.test(txt)) txt = 'fecha=' + p.date + '\n' + txt;
+      var msg = importHealth(txt, p.at); V.hmsg = msg; V.tab = 'hoy';
+      setTimeout(function () { toast(msg.replace('✓ ', '')); }, 300);
+      return true;
+    } catch (e) { V.hmsg = 'No he podido leer los datos del Atajo: ' + (e.message || ''); V.tab = 'ajustes'; return true; }
+  }
   function importFromUrl() {
     try {
       var q = new URLSearchParams(location.search), keys = ['fecha', 'pasos', 'activas', 'reposo', 'peso'], lines = [];
       keys.forEach(function (k) { if (q.get(k)) lines.push(k + '=' + q.get(k)); });
       if (!lines.length) return;
-      var msg = importHealth(lines.join('\n'));
+      var nw = new Date();
+      // Se guarda como pendiente: no se escribe nada hasta haber descargado tus datos de Supabase.
+      lsSet('pendimp', { lines: lines.join('\n'), at: nw.getHours() * 60 + nw.getMinutes(), date: TODAY });
       history.replaceState(null, '', location.pathname);
-      V.hmsg = msg; V.tab = 'hoy'; setTimeout(function () { toast(msg.replace('✓ ', '')); }, 300);
+      V.tab = 'hoy';
     } catch (e) { V.hmsg = 'No he podido leer los datos del Atajo: ' + (e.message || '') + ' · Recibido: ' + decodeURIComponent(location.search).slice(0, 160); try { history.replaceState(null, '', location.pathname); } catch (x) {} V.tab = 'ajustes'; }
   }
 
@@ -1671,7 +1734,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (BUILD === 'web') { render(); await loadConfig(); }
     render();
     initAI();
-    initRemote();
+    await initRemote();
+    if (applyPendingImport()) render();
   })();
   try { if (BUILD === 'web' && navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   if (BUILD === 'web' && 'serviceWorker' in navigator && /^https?:$/.test(location.protocol)) { try { navigator.serviceWorker.register('sw.js'); } catch (e) {} }
