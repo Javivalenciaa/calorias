@@ -349,7 +349,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       source = 'salud';
       // Sin reloj, Salud apenas registra actividad: si queda por debajo de la fórmula (reposo + actividad diaria típica), manda la fórmula.
       var fBase = B * (ACT[S.profile.activity] || ACT.lig).f;
-      if (base + exercise < fBase + manual) { base = fBase; exercise = manual; source = 'formula'; }
+      if (base + exercise < fBase + manual) { var tot0 = fBase + manual; base = Math.max(tot0 - exercise, 0); source = 'formula'; }   // el total manda la fórmula, pero el ejercicio importado se sigue mostrando
     } else {
       base = B * (ACT[S.profile.activity] || ACT.lig).f;
       exercise = manual;
