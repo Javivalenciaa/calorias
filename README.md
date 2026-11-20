@@ -50,6 +50,12 @@ Con eso: objetivo diario que sigue tu gasto aprendido y compensa los excesos de 
 ## Chef y coach
 Botón **+ → Chef y coach** (o «Pregúntale al chef» en Hoy). Guarda tu nevera (escribiendo o con una foto), conoce lo que te queda hoy, tu gasto real y lo que sueles comer, y te propone comidas con gramos exactos que añades a tu día con un toque. También responde dudas sobre tu peso con los datos del modelo. En Ajustes puedes poner tus gustos y alergias.
 
+## Cerebro del gimnasio
+- **Entreno de hoy** (en Hoy): elige los músculos que más series te faltan esta semana y que ya están recuperados, tus ejercicios habituales primero, y te pone la carga de la progresión doble. Un toque en «Empezar» y se rellena el entreno. «Otra opción» genera otra combinación.
+- **Tu fuerza** (en Progreso): 1RM estimado de cada ejercicio, ritmo de mejora aprendido con un modelo bayesiano, estancamientos (y cambio automático por una variante), nivel frente a tu peso y previsión a 8 semanas.
+- **Recuperación por músculo**, **series semanales con sinergias** y **cuánto músculo puedes ganar ahora** con lo que te frena (frecuencia, proteína, déficit, sueño).
+- El **coach** del chat ve todo esto y puede proponerte rutinas que empiezas con un toque.
+
 ## Seguridad
 - `/api/ai` exige sesión de Supabase válida (y `ALLOWED_EMAILS` si lo defines): nadie puede gastar tu cuota de IA sin cuenta.
 - La clave anon de Supabase es pública por diseño; tus datos los protege RLS (`schema.sql`).

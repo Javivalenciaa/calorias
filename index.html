@@ -1053,6 +1053,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (allTop) {
       if (e.k === 'bw' && W === 0) { res.kind = 'subir'; res.w = 2.5; res.r = lo; res.msg = 'Llegaste a ' + hi + ' reps en todas: añade 2,5 kg de lastre y vuelve a ' + lo + ' reps.'; return res; }
       var w2 = roundTo(W + Math.max(st, W * 0.025), st); if (w2 <= W) w2 = W + st;
+      var mr = Math.max.apply(null, reps); if (!(el > 0) && W + bwf > 0) el = (W + bwf) * (1 + Math.min(mr, 20) / 30);   // más de 12 reps: Epley con tope
+      if (el > 0 && mr > hi + 2) {                             // te sobraron muchas reps: salto mayor, al peso que da el centro del rango
+        var wj = roundTo(Math.min(el / (1 + (lo + hi) / 2 / 30) - bwf, W * 1.25), st); if (wj > w2) w2 = wj;
+      }
       res.kind = 'subir'; res.w = w2; res.r = repsAt(w2); res.msg = 'Hiciste ' + reps.join(', ') + ' con ' + fnum(W) + ' kg: sube a ' + fnum(w2) + ' kg y busca ~' + res.r + ' reps.';
     } else if (minR < lo && prevMin != null && prevMin < lo && prev && Math.max.apply(null, prev.sets.map(function (y) { return num(y.w); })) >= W * 0.999) {
       var w3 = Math.max(0, roundTo(W * 0.92, st)); if (w3 >= W) w3 = Math.max(0, W - st);
@@ -1666,6 +1670,209 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
   var MB = { run: run, get: get, forecast: forecast, probGoal: probGoal, tomorrow: tomorrow, explain: explain, correction: correction, rhoOf: rhoOf, fatPct: fatPct, Phi: Phi, BETAS: BETAS, ADAPT: ADAPT, rev: 0 };
   if (typeof module !== 'undefined' && module.exports) module.exports = MB; else root.MB = MB;
+})(typeof window !== 'undefined' ? window : this);
+</script>
+<script>
+/* Cerebro del gimnasio. Módulo puro (sin DOM). Depende de CC y CG. Global: GB.
+   - Progresión por ejercicio: ritmo de mejora del 1RM estimado aprendido con un modelo bayesiano
+     (regresión de log(1RM) con prior de principiante: +1,5 %/sem ± 1,5), estancamiento y previsión a 8 semanas.
+   - Nivel de fuerza relativo a tu peso (estándares aproximados por ejercicio).
+   - Recuperación por músculo: la fatiga de cada serie se disipa de forma exponencial (≈ 42 h; 60 h en piernas y espalda), peor si duermes poco.
+   - Series semanales por músculo contando sinergias (el press de banca también trabaja tríceps, etc.) frente a un objetivo de hipertrofia.
+   - Generador del entreno de hoy: músculos con más carencia y ya recuperados, tus ejercicios habituales primero, carga de la progresión doble.
+   - Potencial de ganar músculo ahora mismo y qué te frena. */
+(function (root) {
+  'use strict';
+  var C = root.CC, G = root.CG, num = C.num, add = C.addDays, diff = C.diffDays;
+  var MAIN = ['pecho', 'espalda', 'hombro', 'biceps', 'triceps', 'pierna', 'gluteo', 'core'];
+  var TARGET = { pecho: 12, espalda: 14, hombro: 10, biceps: 8, triceps: 8, pierna: 14, gluteo: 6, core: 6 };   // series/semana (Schoenfeld 2017; Israetel MEV-MAV)
+  var SYN = { pecho: { triceps: 0.5, hombro: 0.3 }, espalda: { biceps: 0.5, hombro: 0.2 }, hombro: { triceps: 0.3 }, pierna: { gluteo: 0.5, core: 0.2 }, gluteo: { pierna: 0.3 } };
+  var TAU = { pierna: 60, espalda: 60, gluteo: 60 };   // horas para disipar la fatiga (resto: 42 h)
+  // 1RM / peso corporal para pasar a novato, intermedio, avanzado, élite (hombres; mujeres ≈ ×0,6 torso, ×0,7 pierna). Orientativo.
+  var STD = {
+    bench: [0.6, 0.85, 1.15, 1.5], bench_inc: [0.5, 0.75, 1.0, 1.3], db_bench: [0.22, 0.32, 0.45, 0.6], db_inc: [0.2, 0.3, 0.42, 0.55], dips: [1.05, 1.3, 1.6, 1.9],
+    squat: [0.8, 1.2, 1.6, 2.1], front_squat: [0.65, 1.0, 1.35, 1.75], deadlift: [1.0, 1.4, 1.9, 2.4], rdl: [0.8, 1.15, 1.55, 2.0], hip_thrust: [0.9, 1.4, 2.0, 2.5],
+    ohp: [0.4, 0.55, 0.75, 1.0], db_ohp: [0.14, 0.2, 0.28, 0.38], row_bar: [0.5, 0.75, 1.0, 1.3], row_cable: [0.5, 0.75, 1.0, 1.3], row_cable_w: [0.5, 0.75, 1.0, 1.3],
+    lat_pd: [0.5, 0.75, 1.0, 1.25], lat_pd_n: [0.5, 0.75, 1.0, 1.25], pullup: [1.05, 1.3, 1.6, 1.9], chinup: [1.1, 1.35, 1.65, 1.95], pullup_n: [1.05, 1.3, 1.6, 1.9],
+    curl_bar: [0.3, 0.45, 0.6, 0.8], db_curl: [0.11, 0.17, 0.24, 0.32], hammer: [0.12, 0.18, 0.25, 0.33]
+  };
+  // Básicos de cada músculo, del más recomendable al menos (si aún no tienes historial con ellos)
+  var STAPLE = {
+    pecho: ['bench', 'db_bench', 'db_inc', 'bench_inc', 'cable_fly', 'dips', 'db_fly', 'pushup'],
+    espalda: ['lat_pd', 'row_cable', 'pullup', 'row_db', 'row_bar', 'lat_pd_n', 'row_cs', 'chinup', 'straight_arm'],
+    hombro: ['db_ohp', 'lateral', 'ohp', 'lateral_cable', 'face_pull', 'rear_fly', 'arnold'],
+    biceps: ['db_curl', 'hammer', 'curl_bar', 'incline_curl', 'cable_curl'],
+    triceps: ['pushdown_rope', 'oh_cable', 'pushdown_bar', 'skull', 'db_oh', 'dips'],
+    pierna: ['squat', 'rdl', 'goblet', 'bulgarian', 'lunge', 'rdl_db', 'front_squat', 'calf', 'calf_db'],
+    gluteo: ['hip_thrust', 'glute_bridge', 'pull_through', 'abd_cable'],
+    core: ['hang_leg', 'cable_crunch', 'plank', 'pallof', 'hang_knee', 'leg_raise']
+  };
+  var LEVELS = ['principiante', 'novato', 'intermedio', 'avanzado', 'élite'];
+  var PRIOR_RATE = 0.015 / 7, PRIOR_SD = 0.015 / 7, NOISE = 0.04;   // por día; ruido de un 1RM estimado en una sesión ≈ 4 %
+
+  function custom(S) { return (S.settings && S.settings.custom) || []; }
+  function wTime(it) { var g = it.w.gym || {}; return g.end || g.start || C.parseYmd(it.date).getTime(); }
+
+  /* ---------- Fuerza: ritmo de progresión aprendido por ejercicio ---------- */
+  function strength(S, kgAt, today) {
+    var out = {}, cu = custom(S);
+    G.gymWorkouts(S).forEach(function (it) {
+      if (it.date > today) return;
+      var kg = kgAt(it.date);
+      (it.w.gym.exs || []).forEach(function (x) {
+        var e = G.exOf(x.ex, cu); if (G.isCardio(e) || e.k === 't') return;
+        var best = 0; G.workingSets(e, x.sets).forEach(function (s) { best = Math.max(best, G.e1rm(e, s, kg)); });
+        if (!best) return;
+        var r = out[x.ex] || (out[x.ex] = { ex: x.ex, name: e.n, g: e.g, pts: [] });
+        var last = r.pts[r.pts.length - 1];
+        if (last && last.d === it.date) last.v = Math.max(last.v, best); else r.pts.push({ d: it.date, v: best, kg: kg });
+      });
+    });
+    var kgNow = kgAt(today), female = S.profile && S.profile.sex === 'f';
+    Object.keys(out).forEach(function (id) {
+      var r = out[id], p = r.pts, n = p.length, x0 = p[0].d;
+      var xs = p.map(function (q) { return diff(x0, q.d); }), ys = p.map(function (q) { return Math.log(q.v); });
+      var mx = xs.reduce(function (a, b) { return a + b; }, 0) / n, my = ys.reduce(function (a, b) { return a + b; }, 0) / n, sxx = 0, sxy = 0;
+      xs.forEach(function (x, i) { sxx += (x - mx) * (x - mx); sxy += (x - mx) * (ys[i] - my); });
+      var prec = 1 / (PRIOR_SD * PRIOR_SD), m = PRIOR_RATE * prec;                 // combinamos lo que dicen tus sesiones con lo típico de un principiante
+      if (sxx > 0) { var b = sxy / sxx, pd = sxx / (NOISE * NOISE); m += b * pd; prec += pd; }
+      var rate = m / prec, sd = Math.sqrt(1 / prec);
+      r.best = Math.max.apply(null, p.map(function (q) { return q.v; })); r.last = p[n - 1].v; r.n = n; r.lastDate = p[n - 1].d;
+      r.weekPct = (Math.exp(rate * 7) - 1) * 100; r.weekSd = sd * 7 * 100; r.learned = Math.max(0, Math.min(1, 1 - sd / PRIOR_SD));
+      r.proj8 = r.last * Math.exp(rate * 56 * 0.8);
+      var recent = p.slice(-4);
+      r.status = n < 3 ? 'empezando' : (recent.length >= 4 && Math.abs(r.weekPct) < 0.4 && Math.max(recent[1].v, recent[2].v, recent[3].v) <= recent[0].v * 1.01) ? 'estancado'
+        : r.weekPct < -0.5 && r.weekPct + 1.64 * r.weekSd < 0 ? 'bajando' : 'progresando';
+      var st = STD[id];
+      if (st && kgNow > 0) {
+        var f = female ? (r.g === 'pierna' || r.g === 'gluteo' ? 0.7 : 0.6) : 1, rel = r.best / kgNow, lvl = 0;
+        st.forEach(function (t, i) { if (rel >= t * f) lvl = i + 1; });
+        r.rel = rel; r.level = LEVELS[lvl]; r.next = lvl < 4 ? { level: LEVELS[lvl + 1], kg: st[lvl] * f * kgNow } : null;
+      }
+    });
+    return out;
+  }
+
+  /* ---------- Recuperación por músculo ---------- */
+  function recovery(S, now, today) {
+    var res = {}, cu = custom(S), from = add(today, -10);
+    MAIN.forEach(function (g) { res[g] = { g: g, fatigue: 0, last: null, sets: 0 }; });
+    G.gymWorkouts(S).forEach(function (it) {
+      if (it.date < from || it.date > today) return;
+      var hrs = Math.max(0, (now - wTime(it)) / 3.6e6);
+      (it.w.gym.exs || []).forEach(function (x) {
+        var e = G.exOf(x.ex, cu); if (G.isCardio(e)) return;
+        var n = G.workingSets(e, x.sets).length; if (!n) return;
+        var parts = [[e.g, 1]]; Object.keys(SYN[e.g] || {}).forEach(function (k) { parts.push([k, SYN[e.g][k]]); });
+        parts.forEach(function (pp) {
+          var r = res[pp[0]]; if (!r) return;
+          r.fatigue += n * pp[1] * Math.exp(-hrs / (TAU[pp[0]] || 42));
+          if (pp[1] === 1 && (!r.last || hrs < r.lastH)) { r.last = it.date; r.lastH = hrs; }
+        });
+      });
+    });
+    var dd = (S.days || {})[today] || {}, sl = num(dd.sleep, 0) || (dd.health && num(dd.health.sleep, 0)) || 0, pen = sl > 0 && sl < 6.5 ? 0.1 : 0;
+    MAIN.forEach(function (g) { var r = res[g]; r.ready = Math.max(0, Math.min(1, 1 - r.fatigue / 7 - pen)); r.sleepPen = pen > 0; });
+    return res;
+  }
+
+  /* ---------- Series de la semana con sinergias ---------- */
+  function weekSets(S, today) {
+    var out = {}, cu = custom(S), from = add(today, -6);
+    MAIN.forEach(function (g) { out[g] = 0; });
+    G.gymWorkouts(S).forEach(function (it) {
+      if (it.date < from || it.date > today) return;
+      (it.w.gym.exs || []).forEach(function (x) {
+        var e = G.exOf(x.ex, cu); if (G.isCardio(e)) return;
+        var n = G.workingSets(e, x.sets).length; if (!n) return;
+        if (out[e.g] != null) out[e.g] += n;
+        Object.keys(SYN[e.g] || {}).forEach(function (k) { out[k] += n * SYN[e.g][k]; });
+      });
+    });
+    return out;
+  }
+
+  /* ---------- Entreno de hoy ---------- */
+  function rnd(seed) { var s = (seed >>> 0) || 1; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+  function plan(S, kgAt, today, now, opt) {
+    opt = opt || {};
+    var rand = rnd((opt.seed || 0) * 7919 + 13), cu = custom(S), kg = kgAt(today), budget = opt.sets || 18;
+    var ws = weekSets(S, today), rec = recovery(S, now, today), str = strength(S, kgAt, today);
+    var hist = {}, recent = {}; G.gymWorkouts(S).forEach(function (it) { (it.w.gym.exs || []).forEach(function (x) { hist[x.ex] = (hist[x.ex] || 0) + 1; if (diff(it.date, today) <= 4) recent[x.ex] = 1; }); });
+    var trainedToday = G.gymWorkouts(S).some(function (it) { return it.date === today; });
+    var consec = 0; for (var i = 1; i <= 4; i++) { if (G.gymWorkouts(S).some(function (it) { return it.date === add(today, -i); })) consec++; else break; }
+    var need = MAIN.map(function (g) {
+      var deficit = Math.max(0, TARGET[g] - ws[g]);
+      return { g: g, deficit: deficit, ready: rec[g].ready, score: (deficit / TARGET[g]) * rec[g].ready + rand() * 0.05 };
+    }).filter(function (x) { return x.ready >= 0.6 && x.deficit >= 2; }).sort(function (a, b) { return b.score - a.score; });
+    var chosen = [], left = budget, bonus = {};
+    need.forEach(function (x) {
+      if (chosen.length >= 4 || left < 3) return;
+      if (x.g === 'core' && chosen.length < 2) return;                                   // el core, de remate
+      var s = Math.max(3, Math.min(x.g === 'core' ? 4 : 8, Math.round(x.deficit * 0.6 + (bonus[x.g] || 0)), left));
+      chosen.push({ g: x.g, sets: s, ready: x.ready, deficit: x.deficit }); left -= s;
+      Object.keys(SYN[x.g] || {}).forEach(function (k) { bonus[k] = (bonus[k] || 0) + 1; });
+    });
+    if (!chosen.length && need.length) chosen.push({ g: need[0].g, sets: Math.min(6, Math.round(need[0].deficit)), ready: need[0].ready, deficit: need[0].deficit });
+    var avail = G.catalog(S.settings && S.settings.equipOff, cu).filter(function (e) { return !G.isCardio(e) && e.g !== 'cuerpo'; });
+    var exs = [];
+    chosen.forEach(function (c) {
+      var pool = avail.filter(function (e) { return e.g === c.g; }).map(function (e) {
+        var s = str[e.id], rk = (STAPLE[c.g] || []).indexOf(e.id), sc = Math.log(1 + (hist[e.id] || 0)) * 1.2 + (rk >= 0 ? 1.2 - 0.12 * rk : 0) + (e.m === 'L' ? 0.2 : e.m === 'M' ? 0.15 : 0) + rand() * 0.35;
+        if (e.k === 'bw' && e.o.bw >= 0.6 && c.g === 'pierna') sc -= 0.8;                // sentadillas sin peso: poco estímulo para tu nivel
+        if (s && s.status === 'estancado') sc = sc * 0.3 - 0.5;                          // estancado: toca variante
+        if (recent[e.id]) sc -= 0.25;
+        if (e.k === 't') sc -= 0.4;
+        return { e: e, sc: sc };
+      }).sort(function (a, b) { return b.sc - a.sc; });
+      if (!pool.length) return;
+      var nEx = c.sets >= 6 ? 2 : 1, picks = [pool[0]];
+      var HINGE = /rdl|stiff_leg|nordic|deadlift|good_morning|hip_thrust|glute_bridge|pull_through/;
+      if (nEx === 2) {                                                                   // en pierna: una de rodilla y otra de cadera
+        var alt = c.g === 'pierna' ? pool.filter(function (p) { return p.e.id !== pool[0].e.id && HINGE.test(p.e.id) !== HINGE.test(pool[0].e.id) && !/calf/.test(p.e.id); })[0] : null;
+        if (alt || pool[1]) picks.push(alt || pool[1]);
+      }
+      var per = picks.length === 2 ? [Math.ceil(c.sets / 2), Math.floor(c.sets / 2)] : [c.sets];
+      picks.forEach(function (p, k) {
+        var e = p.e, sg = hist[e.id] ? G.suggest(S, e.id, kg, cu) : null, rr = G.repRange(e), s = str[e.id];
+        var why = sg ? sg.msg : e.k === 'bw' ? 'Primera vez: haz series de ' + rr[0] + '–' + rr[1] + ' reps dejando 1–2 en reserva.' : 'Primera vez: busca un peso con el que llegues a ' + rr[1] + ' reps dejando 2 en reserva.';
+        if (s && s.status === 'estancado') why += ' Llevas varias sesiones sin mejorar aquí: si hoy tampoco, la próxima lo cambio por una variante.';
+        var stuck = Object.keys(str).filter(function (id) { var q = str[id]; return q.status === 'estancado' && q.g === e.g && id !== e.id; })[0];
+        if (stuck && !hist[e.id]) why = 'Sustituye a ' + str[stuck].name.toLowerCase() + ', que lleva semanas estancado. ' + why;
+        exs.push({ ex: e.id, name: e.n, g: e.g, sets: Math.max(2, per[k]), w: sg && sg.w > 0 ? sg.w : null, r: sg ? sg.r : rr[1], lo: rr[0], hi: rr[1], why: why });
+      });
+    });
+    exs.sort(function (a, b) { var ea = G.exOf(a.ex, cu), eb = G.exOf(b.ex, cu), o = { L: 0, M: 1, S: 2 }; return (a.g === 'core') - (b.g === 'core') || o[ea.m] - o[eb.m]; });
+    var total = exs.reduce(function (s, x) { return s + x.sets; }, 0);
+    var rest = trainedToday ? 'hecho' : consec >= 3 ? 'descanso' : !exs.length ? 'completo' : null;
+    var name = G.autoName(exs.map(function (x) { return { ex: x.ex, sets: new Array(x.sets) }; }), cu);
+    return { name: name, exs: exs, sets: total, minutes: Math.round(8 + total * 2.8), chosen: chosen, rest: rest, consec: consec, weekSets: ws, recovery: rec };
+  }
+
+  /* ---------- Potencial de ganar músculo ahora ---------- */
+  function potential(S, model, today) {
+    var P = S.profile || {}, yrs = num(S.settings && S.settings.trainYears, -1), all = G.gymWorkouts(S);
+    if (yrs < 0) yrs = all.length ? Math.max(0, diff(all[0].date, today) / 365) : 0;
+    var base = yrs < 1 ? 1.0 : yrs < 2 ? 0.5 : yrs < 3 ? 0.25 : 0.12;                // kg de músculo/mes en condiciones ideales (hombre; Aragon/McDonald)
+    if (P.sex === 'f') base *= 0.5;
+    var f = [], kg = model && model.ok ? model.F : P.weight, sm = C.summary(S, Object.assign(C.makeCtx(S), { calib: model && model.ok ? model.calib : 1 }), today, 14);
+    var sess = all.filter(function (a) { return a.date > add(today, -28) && a.date <= today; }).length / 4;
+    var ppk = sm ? sm.p / kg : null, bal = model && model.ok && sm ? sm.intake - model.tdee : (sm ? sm.balance : null);
+    var sl = []; for (var i = 0; i < 14; i++) { var d = (S.days || {})[add(today, -i)] || {}, s = num(d.sleep, 0) || (d.health && num(d.health.sleep, 0)); if (s > 0) sl.push(s); }
+    var sleep = sl.length ? sl.reduce(function (a, b) { return a + b; }, 0) / sl.length : null;
+    var m = 1;
+    function lim(k, mult, t) { m *= mult; f.push({ k: k, mult: mult, t: t }); }
+    if (sess < 2) lim('freq', sess < 1 ? 0.25 : 0.55, 'Entrenas ' + String(Math.round(sess * 10) / 10).replace('.', ',') + ' veces por semana: con 3–4 sesiones crecerías bastante más.');
+    else if (sess < 3) lim('freq', 0.8, 'Con 3–4 sesiones por semana (ahora ' + String(Math.round(sess * 10) / 10).replace('.', ',') + ') ganarías algo más.');
+    if (ppk != null && ppk < 1.6) lim('prot', ppk < 1.2 ? 0.6 : 0.8, 'Proteína: ' + String(Math.round(ppk * 10) / 10).replace('.', ',') + ' g/kg. Sube a 1,6–2,2 g/kg (' + Math.round(1.8 * kg) + ' g/día).');
+    if (bal != null && bal < -150) lim('deficit', yrs < 1 ? (bal < -500 ? 0.35 : 0.55) : (bal < -500 ? 0.15 : 0.3), 'Estás en déficit (' + Math.round(bal) + ' kcal/día): ' + (yrs < 1 ? 'aun así, como principiante puedes ganar músculo mientras pierdes grasa (recomposición).' : 'en déficit cuesta mucho ganar músculo; tu prioridad es conservarlo.'));
+    if (sleep != null && sleep < 7) lim('sleep', sleep < 6 ? 0.7 : 0.85, 'Duermes ' + String(Math.round(sleep * 10) / 10).replace('.', ',') + ' h: con 7–9 h recuperas y creces más.');
+    f.sort(function (a, b) { return a.mult - b.mult; });
+    return { ideal: base, now: base * m, years: yrs, sessions: sess, ppk: ppk, balance: bal, sleep: sleep, limits: f };
+  }
+
+  var GB = { STAPLE: STAPLE, strength: strength, recovery: recovery, weekSets: weekSets, plan: plan, potential: potential, TARGET: TARGET, MAIN: MAIN, LEVELS: LEVELS, STD: STD };
+  root.GB = GB;
 })(typeof window !== 'undefined' ? window : this);
 </script>
 <script>
@@ -2351,6 +2558,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<div class="tiny muted" style="margin-top:10px">Proteína objetivo: ' + f1(T.ppk) + ' g/kg · ' + fmt(T.protein) + ' g/día' + (macroK ? ' · reparto ' + Math.round(di.p * 400 / macroK) + '/' + Math.round(di.c * 400 / macroK) + '/' + Math.round(di.f * 900 / macroK) + ' %' : '') + '</div></div>';
 
     h += cNext(T, di);
+    h += gymToday();
     MEALS.forEach(function (mt) {
       var ms = day.meals.filter(function (m) { return mealSlot(m.type) === mt[0]; });
       var kc = 0, pr = 0; ms.forEach(function (m) { kc += m.k; pr += m.p; });
@@ -2607,6 +2815,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<div class="kv"><span>Proteína · Hidratos · Grasa</span><b>' + fmt(T.protein) + ' · ' + fmt(T.carbs) + ' · ' + fmt(T.fat) + ' g</b></div></div>';
 
     h += fastProgress();
+    h += gymBrainCard();
     h += gymProgress();
     var rp = lsGet('report');
     h += '<div class="card"><h2>Informe con IA</h2><p class="small ink2" style="margin-top:0">La IA lee tu historial (comidas, entrenos y pesajes) y te dice cómo vas.</p>' +
@@ -3408,6 +3617,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   Object.keys(COACH_ACTIONS).forEach(function (k) { ACTIONS[k] = COACH_ACTIONS[k]; });
   function cInput(t) {
     var b = t.dataset.bind;
+    if (b === 'cgyears') { S.settings.trainYears = CC.num(t.value, -1); touchCore(); var y0 = window.scrollY; render(); window.scrollTo(0, y0); return; }
     if (b === 'cgprefs') { S.settings.prefs = String(t.value || '').slice(0, 600); touchCore(); return; }
     if (b === 'cgcomp') { S.settings.compensate = !!t.checked; touchCore(); return; }
     if (b === 'cggoal') { var v = CC.num(t.value); S.profile.goalKg = v > 30 && v < 250 ? v : null; touchCore(); if (V.tab === 'progreso') { var y = window.scrollY; render(); window.scrollTo(0, y); } }
@@ -3602,7 +3812,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   }
 
   /* ====================== CHEF Y COACH (chat) ====================== */
-  var QUICK = ['¿Qué como ahora con lo que tengo?', 'Planifícame el resto del día', 'Algo dulce que encaje', 'Voy a comer fuera: ¿qué pido?', '¿Por qué ha cambiado mi peso?', '¿Cómo voy esta semana?'];
+  var QUICK = ['¿Qué como ahora con lo que tengo?', 'Planifícame el resto del día', '¿Qué entreno hoy?', 'Hazme una rutina para ganar músculo', 'Algo dulce que encaje', 'Voy a comer fuera: ¿qué pido?', '¿Por qué ha cambiado mi peso?', '¿Cómo voy esta semana?', '¿Por qué no progreso en un ejercicio?'];
   function chatLog() { return lsGet('chat') || []; }
   function chatSave(l) { lsSet('chat', l.slice(-40)); }
   function fridge() { return S.settings.fridge || []; }
@@ -3647,6 +3857,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     log.forEach(function (m, i) {
       if (m.r === 'u') { h += '<div style="text-align:right;margin:10px 0"><span class="small" style="display:inline-block;text-align:left;background:var(--s1-track);color:var(--ink);padding:9px 13px;border-radius:16px 16px 4px 16px;max-width:85%">' + esc(m.t) + (m.ph ? ' 📷' : '') + '</span></div>'; return; }
       h += '<div class="card" style="border-left:4px solid var(--s1)">' + mdLite(m.t) + (m.opts || []).map(function (o, j) { return optHtml(o, i, j); }).join('') +
+        (m.rt ? '<div style="border-top:1px solid var(--ring);margin-top:10px;padding-top:10px"><b>🏋️ ' + esc(m.rt.name) + '</b>' + planListHtml(m.rt) + '<button class="primary full" data-act="chatroutine" data-i="' + i + '" style="margin-top:8px">▶ Empezar este entreno</button></div>' : '') +
         (m.fr && (m.fr.add.length || m.fr.del.length) ? '<div class="tiny muted" style="margin-top:8px">🧊 Nevera actualizada' + (m.fr.add.length ? ' · +' + esc(m.fr.add.join(', ')) : '') + (m.fr.del.length ? ' · −' + esc(m.fr.del.join(', ')) : '') + '</div>' : '') + '</div>';
     });
     if (c.busy) h += '<div class="card small muted">Pensando…</div>';
@@ -3672,12 +3883,13 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       modelo: o.ok ? Object.assign(mbSummary(), { prevision_manana_kg: tm ? CC.round(tm.mean, 1) + ' (80%: ' + CC.round(tm.lo, 1) + '-' + CC.round(tm.hi, 1) + ')' : null,
         ultima_pesada: ex ? { fecha: ex.d, pesaste: ex.y, esperado: CC.round(ex.expected, 1), desglose: ex.parts.map(function (p) { return p.label + ' ' + CC.round(p.kg, 2); }) } : null }) : null,
       ultimos_7_dias: last7, pesadas: CC.makeCtx(S).weights.slice(-10).map(function (w) { return w.d + ': ' + w.kg + ' kg' + (w.fasted === false ? ' (no en ayunas)' : ''); }),
+      gimnasio: gymCoachData(),
       nevera: fridge(), gustos_y_restricciones: S.settings.prefs || '', alimentos_habituales: mem.alimentos_habituales.slice(0, 15), aprendizajes: (S.memory && S.memory.notes) || []
     };
   }
   function chatPrompt(text, log, hasPhoto) {
     var hist = log.slice(-9, -1).map(function (m) { return (m.r === 'u' ? 'PERSONA: ' : 'TÚ: ') + String(m.t).slice(0, 500) + (m.opts && m.opts.length ? ' [propusiste: ' + m.opts.map(function (o) { return o.name + ' ' + o.k + ' kcal' + (o.added ? ' (la añadió)' : ''); }).join('; ') + ']' : ''); }).join('\n');
-    return 'Eres el chef y entrenador personal de esta persona: nutricionista deportivo y cocinero práctico. Hablas en español de España, tuteas, eres directo, concreto y cercano, sin sermones. Conoces sus datos reales (JSON de abajo), incluido un modelo bayesiano que ha aprendido su gasto real y cuánto mueven su báscula el agua y la comida.\n\n' +
+    return 'Eres el chef y entrenador personal de esta persona: nutricionista deportivo, entrenador de fuerza e hipertrofia y cocinero práctico. Hablas en español de España, tuteas, eres directo, concreto y cercano, sin sermones. Conoces sus datos reales (JSON de abajo), incluido un modelo bayesiano que ha aprendido su gasto real y cuánto mueven su báscula el agua y la comida.\n\n' +
       'OBJETIVO: que cumpla su objetivo de hoy lo mejor posible (o se desvíe lo mínimo) y avance hacia su meta comiendo cosas que tenga y le apetezcan.\n' +
       'REGLAS:\n' +
       '- Si pregunta qué comer: propón 1-3 opciones en "opciones", usando PRIMERO lo que hay en "nevera" (si está vacía, cosas normales de un súper español). Ajusta los gramos para que encajen en lo que le QUEDA hoy repartido entre "comidas_por_delante", priorizando llegar a la proteína. Si ya se ha pasado, propón lo más ligero y saciante y dile cómo lo compensa la app (compensacion_kcal) sin agobiarse.\n' +
@@ -3689,8 +3901,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '- Si pregunta por su peso o su progreso, explícalo con "modelo" (peso real frente a agua, gasto real, previsión, precisión) y cifras concretas.\n' +
       '- Si dice que se le ha acabado algo, que ha comprado algo o que ha usado algo, actualiza "nevera_quitar" / "nevera_anadir" (nombres cortos, en minúscula).\n' +
       '- Si hay foto: si es una nevera o despensa, pon lo que ves en "nevera_anadir"; si es una carta o un plato, ayúdale a elegir.\n' +
+      '- GIMNASIO: usa "gimnasio" (series de la semana frente al objetivo, recuperación de cada músculo, ritmo de progresión y nivel de cada ejercicio, potencial de ganar músculo y lo que le limita). Da consejos concretos: ejercicios, series, reps, kg y descansos, técnica clave, cómo romper un estancamiento (variante, descarga del 10 %, más descanso o sueño) y qué ajustar en la dieta para ganar músculo (proteína por toma, timing, energía). Si pide qué entrenar hoy o una rutina, devuelve "rutina" SOLO con ids de "ejercicios_disponibles", empezando por los multiarticulares y respetando la recuperación; si pide una rutina semanal, describe el reparto de días en "respuesta" y pon en "rutina" la sesión de hoy.\n' +
       '- Nada de consejos médicos. "respuesta" breve (máx. 110 palabras) en Markdown sencillo (**negrita**, listas con -). Si no hacen falta opciones, "opciones": [].\n' +
-      'Responde ÚNICAMENTE con JSON válido: {"respuesta":"...","opciones":[{"nombre":"...","tipo":"Desayuno|Comida|Merienda|Cena|Snack","por_que":"...","pasos":["..."],"alimentos":[{"n":"...","g":0,"k":0,"p":0,"c":0,"f":0}]}],"nevera_quitar":[],"nevera_anadir":[]}\n\n' +
+      'Responde ÚNICAMENTE con JSON válido: {"respuesta":"...","opciones":[{"nombre":"...","tipo":"Desayuno|Comida|Merienda|Cena|Snack","por_que":"...","pasos":["..."],"alimentos":[{"n":"...","g":0,"k":0,"p":0,"c":0,"f":0}]}],"rutina":null,"nevera_quitar":[],"nevera_anadir":[]}\n' +
+      'Si propones entreno, "rutina" es: {"nombre":"...","ejercicios":[{"id":"<id del catálogo>","series":3,"reps":10,"kg":null,"nota":"clave técnica o por qué"}]} (kg: número si sabes su carga por su historial; si no, null).\n\n' +
       'DATOS:\n' + JSON.stringify(chatContext()) + (hist ? '\n\nCONVERSACIÓN PREVIA:\n' + hist : '') + '\n\nMENSAJE ACTUAL' + (hasPhoto ? ' (con foto adjunta)' : '') + ': ' + (text || '(mira la foto)');
   }
   function cleanOpts(list) {
@@ -3712,8 +3926,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var photo = c.photo; c.input = ''; c.photo = null; c.busy = true; c.err = ''; renderSheet(); scrollChat();
     try {
       var r = await aiJson(chatPrompt(text, log, !!photo), photo);
-      var msg = { r: 'a', t: String(r.respuesta || r.reply || r.text || '').slice(0, 4000), opts: cleanOpts(r.opciones || r.options), ts: Date.now() };
-      if (!msg.t && !msg.opts.length) throw { code: 'parse' };
+      var msg = { r: 'a', t: String(r.respuesta || r.reply || r.text || '').slice(0, 4000), opts: cleanOpts(r.opciones || r.options), rt: cleanRoutine(r.rutina), ts: Date.now() };
+      if (!msg.t && !msg.opts.length && !msg.rt) throw { code: 'parse' };
       var add = (r.nevera_anadir || r['nevera_añadir'] || []).map(String).filter(Boolean), del = (r.nevera_quitar || []).map(function (x) { return String(x).toLowerCase().trim(); }).filter(Boolean);
       if (add.length || del.length) {
         setFridge(fridge().filter(function (n) { var l = n.toLowerCase(); return !del.some(function (x) { return l === x || l.indexOf(x) >= 0 || x.indexOf(l) >= 0; }); }).concat(add));
@@ -3760,6 +3974,93 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     try { V.chat.photo = await (window.__prepPhoto || prepPhoto)(f); } catch (e) { V.chat.err = 'No he podido leer esa foto.'; }
     renderSheet(); var el = $('#chatin'); if (el) el.focus();
   }
+
+  /* ====================== CEREBRO DEL GIMNASIO (interfaz) ====================== */
+  function gbKgAt(d) { return ctxNow().weightAt(d); }
+  function gbPlan() { var k = TODAY + '|' + (V.gseed || 0) + '|' + MB.rev; if (V._gbk !== k) { V._gbk = k; V._gbp = GB.plan(S, gbKgAt, TODAY, Date.now(), { seed: V.gseed || 0 }); } return V._gbp; }
+  function readyChip(r) {
+    var p = Math.round(r.ready * 100), c = p >= 85 ? 'var(--s1)' : p >= 60 ? 'var(--s2)' : 'var(--warn,#c9822b)';
+    return '<span class="chip" style="min-height:30px;padding:4px 10px;font-size:12.5px;cursor:default"><i class="dot" style="background:' + c + '"></i>' + esc(CG.GROUPS[r.g]) + ' ' + p + ' %</span>';
+  }
+  function recoveryHtml(rec) {
+    return '<div class="chips" style="gap:6px;margin-top:8px">' + GB.MAIN.map(function (g) { return readyChip(rec[g]); }).join('') + '</div>' +
+      (rec.pecho && rec.pecho.sleepPen ? '<div class="tiny muted" style="margin-top:4px">Dormiste poco: recuperas algo más lento hoy.</div>' : '');
+  }
+  function planListHtml(p) {
+    return p.exs.map(function (x) {
+      return '<div class="kv" style="display:block;padding:8px 0"><div class="row sp"><b class="small">' + esc(x.name) + '</b><b class="small">' + x.sets + ' × ' + x.r + (x.w != null ? ' · ' + gnum(x.w) + ' kg' : '') + '</b></div><div class="tiny muted">' + esc(x.why) + '</div></div>';
+    }).join('');
+  }
+  function gymToday() {
+    if (V.date !== TODAY || V.gym) return '';
+    var p = gbPlan(), h = '<div class="card"><div class="row sp"><h2 style="margin:0">🏋️ Entreno de hoy</h2>' + (p.exs.length && p.rest !== 'hecho' ? '<span class="tiny muted">' + p.sets + ' series · ~' + p.minutes + ' min</span>' : '') + '</div>';
+    if (p.rest === 'hecho' && !V.gforce) return h + '<div class="small ink2" style="margin-top:6px">✅ Hoy ya has entrenado. Así van tus músculos:</div>' + recoveryHtml(p.recovery) + '<button class="ghost full" data-act="gforce" style="margin-top:10px">Ver qué entrenaría ahora</button></div>';
+    if (p.rest === 'descanso' && !V.gforce) return h + '<div class="small ink2" style="margin-top:6px">😴 Llevas ' + p.consec + ' días seguidos entrenando: hoy toca descansar para crecer. El músculo se construye mientras recuperas.</div>' + recoveryHtml(p.recovery) + '<button class="ghost full" data-act="gforce" style="margin-top:10px">Entrenar igualmente</button></div>';
+    if (!p.exs.length) return h + '<div class="small ink2" style="margin-top:6px">Esta semana ya has cubierto el volumen de todos tus músculos o aún se están recuperando. Descansa o haz cardio suave.</div>' + recoveryHtml(p.recovery) + '</div>';
+    h += '<div class="small ink2" style="margin:4px 0 2px"><b>' + esc(p.name) + '</b>: ' + p.chosen.map(function (c) { return esc(CG.GROUPS[c.g].toLowerCase()) + ' (' + Math.round(c.ready * 100) + ' % recuperado, te faltan ' + Math.round(c.deficit) + ' series esta semana)'; }).join(', ') + '.</div>';
+    h += planListHtml(p);
+    h += '<div class="row" style="margin-top:10px;gap:8px"><button class="primary grow" data-act="gplan">▶ Empezar</button><button class="ghost" data-act="gshuffle">🔀 Otra opción</button></div>';
+    return h + '<details style="margin-top:8px"><summary class="small">Recuperación de cada músculo</summary>' + recoveryHtml(p.recovery) + '</details></div>';
+  }
+  function startPlan(p) {
+    if (V.gym) { openGym(); toast('Tienes un entreno en curso'); return; }
+    V._gp = {}; V._gs = {};
+    V.gym = { id: uid(), date: TODAY, start: Date.now(), retro: false, name: p.name, exs: [], rest: null };
+    V.gym.exs = p.exs.map(function (q) {
+      var x = gnewEx(q.ex); if (!x.sets) return x;
+      x.sets = []; for (var i = 0; i < q.sets; i++) { var s = gnewSet(); if (q.w != null) s.w = q.w; x.sets.push(s); }
+      return x;
+    });
+    gsave(); V.gview = 'main'; openGym();
+  }
+
+  function gymBrainCard() {
+    var str = GB.strength(S, gbKgAt, TODAY), ids = Object.keys(str), o = mbNow(), pot = GB.potential(S, o, TODAY), rec = GB.recovery(S, Date.now(), TODAY);
+    var h = '<div class="card"><h2>💪 Tu fuerza y tu músculo</h2>';
+    if (ids.length) {
+      ids.sort(function (a, b) { return str[b].n - str[a].n || str[b].best - str[a].best; });
+      h += '<div class="tiny muted" style="margin-top:-4px">1RM estimado (lo máximo que moverías a una repetición) y a qué ritmo mejoras, aprendido de tus sesiones</div>';
+      ids.slice(0, 8).forEach(function (id) {
+        var r = str[id], col = r.status === 'progresando' ? 'good' : r.status === 'estancado' || r.status === 'bajando' ? 'warn' : 'muted';
+        h += '<div class="kv" style="display:block;padding:8px 0"><div class="row sp"><b class="small">' + esc(r.name) + '</b><b class="small">' + fmt(r.best) + ' kg</b></div>' +
+          '<div class="tiny"><span class="' + col + '">' + r.status + '</span> · ' + (r.weekPct >= 0 ? '+' : '') + f1(r.weekPct) + ' % por semana' + (r.learned < 0.3 ? ' (estimado, aún pocas sesiones)' : ' ± ' + f1(r.weekSd)) + ' · en 8 semanas ≈ ' + fmt(r.proj8) + ' kg</div>' +
+          (r.level ? '<div class="tiny muted">Nivel: <b>' + r.level + '</b> (' + f2(r.rel) + ' × tu peso)' + (r.next ? ' · ' + r.next.level + ' a partir de ' + fmt(r.next.kg) + ' kg' : '') + '</div>' : '') + '</div>';
+      });
+    } else h += '<p class="small ink2">Registra tus entrenos de fuerza y aprenderé a qué ritmo progresas en cada ejercicio.</p>';
+    h += '<h3>Recuperación ahora</h3>' + recoveryHtml(rec);
+    h += '<h3>¿Cuánto músculo puedes ganar ahora?</h3><div class="small ink2">En condiciones ideales, con tu experiencia: <b>~' + f1(pot.ideal) + ' kg/mes</b>. Tal y como vas: <b>~' + f1(pot.now) + ' kg/mes</b>.</div>';
+    if (pot.limits.length) h += '<ul class="small ink2" style="padding-left:18px;margin:6px 0">' + pot.limits.map(function (l) { return '<li style="margin:3px 0">' + esc(l.t) + '</li>'; }).join('') + '</ul>';
+    else h += '<div class="small good" style="margin-top:4px">Lo estás haciendo todo bien: frecuencia, proteína, energía y sueño.</div>';
+    h += '<div class="field" style="margin-top:10px"><label>¿Cuánto llevas entrenando fuerza en serio?</label><select data-bind="cgyears">' + [[-1, 'Calcularlo con mis registros'], [0, 'Menos de 1 año'], [1, '1–2 años'], [2, '2–3 años'], [3, 'Más de 3 años']].map(function (o2) { return '<option value="' + o2[0] + '"' + (CC.num(S.settings.trainYears, -1) === o2[0] ? ' selected' : '') + '>' + o2[1] + '</option>'; }).join('') + '</select></div>';
+    return h + '<div class="tiny muted">Estimaciones orientativas basadas en la literatura (Aragon, McDonald, Schoenfeld). El ritmo de cada ejercicio se aprende con un modelo bayesiano que parte de lo típico en un principiante y se ajusta a ti.</div></div>';
+  }
+  function gymCoachData() {
+    var p = gbPlan(), str = GB.strength(S, gbKgAt, TODAY), pot = GB.potential(S, mbNow(), TODAY), ws = GB.weekSets(S, TODAY);
+    return {
+      entreno_recomendado_hoy: p.rest === 'hecho' ? 'ya entrenó hoy' : p.exs.map(function (x) { return x.name + ' ' + x.sets + 'x' + x.r + (x.w != null ? ' @' + x.w + 'kg' : ''); }),
+      series_ultimos_7_dias_vs_objetivo: GB.MAIN.map(function (g) { return CG.GROUPS[g] + ' ' + CC.round(ws[g], 1) + '/' + GB.TARGET[g]; }),
+      recuperacion_pct: GB.MAIN.map(function (g) { return CG.GROUPS[g] + ' ' + Math.round(p.recovery[g].ready * 100); }),
+      fuerza: Object.keys(str).sort(function (a, b) { return str[b].n - str[a].n; }).slice(0, 10).map(function (id) { var r = str[id]; return r.name + ': 1RM ' + Math.round(r.best) + ' kg, ' + CC.round(r.weekPct, 1) + '%/sem, ' + r.status + (r.level ? ', nivel ' + r.level : ''); }),
+      potencial_musculo_kg_mes: { ideal: CC.round(pot.ideal, 2), ahora: CC.round(pot.now, 2), limitantes: pot.limits.map(function (l) { return l.t; }) },
+      ejercicios_disponibles: CG.catalog(S.settings.equipOff, gcustom()).filter(function (e) { return !CG.isCardio(e); }).map(function (e) { return e.id + '=' + e.n; }).join('; ')
+    };
+  }
+  function cleanRoutine(r) {
+    if (!r || !Array.isArray(r.ejercicios)) return null;
+    var exs = r.ejercicios.map(function (x) {
+      var id = String(x.id || ''), e = CG.exOf(id, gcustom()); if (!e || e.n === id || CG.isCardio(e)) return null;
+      var rr = CG.repRange(e);
+      return { ex: id, name: e.n, g: e.g, sets: Math.max(1, Math.min(8, Math.round(CC.num(x.series, 3)))), r: Math.max(1, Math.round(CC.num(x.reps, rr[1]))), w: CC.num(x.kg, 0) > 0 ? CC.num(x.kg) : null, why: String(x.nota || '').slice(0, 160) };
+    }).filter(Boolean);
+    return exs.length ? { name: String(r.nombre || 'Rutina del coach').slice(0, 60), exs: exs } : null;
+  }
+  var GB_ACTIONS = {
+    gplan: function () { startPlan(gbPlan()); },
+    gshuffle: function () { V.gseed = (V.gseed || 0) + 1; render(); },
+    gforce: function () { V.gforce = true; render(); },
+    chatroutine: function (t) { var m = chatLog()[+t.dataset.i]; if (!m || !m.rt) return; V.sheet = null; startPlan(m.rt); }
+  };
+  Object.keys(GB_ACTIONS).forEach(function (k) { ACTIONS[k] = GB_ACTIONS[k]; });
 
   /* ====================== Arranque ====================== */
   function importHealth(txt, atMin) {
