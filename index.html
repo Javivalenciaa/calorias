@@ -466,8 +466,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
   // Ajusta el gasto de la fórmula al gasto real observado (peso vs. ingesta)
   function calibrate(S, ctx, today) {
-    var ad = adaptive(S, ctx, today);
-    ctx.calib = (ad.ok && ad.conf !== 'baja') ? Math.min(1.25, Math.max(0.85, ad.tdee / ad.formula)) : 1;
+    var ad = adaptive(S, ctx, today), mb = root.MB ? root.MB.get(S, today) : null;
+    if (mb && mb.ok) { ctx.calib = mb.calib; ctx.model = mb; }                      // el modelo bayesiano mezcla fórmula y datos según su confianza
+    else ctx.calib = (ad.ok && ad.conf !== 'baja') ? Math.min(1.25, Math.max(0.85, ad.tdee / ad.formula)) : 1;
     return ad;
   }
 
@@ -476,8 +477,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var B = bmr(P, kg);
     var ad = adaptive(S, ctx, today);
     var sm = summary(S, ctx, today, 14);
-    var ref, source;
-    if (ad.ok && ad.conf !== 'baja') { ref = ad.tdee; source = 'real'; }
+    var ref, source, mb = root.MB ? root.MB.get(S, today) : null;
+    if (mb && mb.ok) { ref = mb.tdee; source = mb.learned >= 0.5 ? 'real' : 'modelo'; }
+    else if (ad.ok && ad.conf !== 'baja') { ref = ad.tdee; source = 'real'; }
     else if (sm) { ref = sm.tdee; source = 'formula'; }
     else { ref = B * (ACT[P.activity] || ACT.lig).f + 250; source = 'estimado'; }
     var rate = num(P.rate, 0.25);
@@ -487,7 +489,11 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var protein = ppk * kg;
     var fat = Math.max(0.8 * kg, 0.25 * kcal / 9);
     var carbs = Math.max(0, (kcal - 4 * protein - 9 * fat) / 4);
-    return { ref: ref, source: source, offset: offset, kcal: kcal, protein: protein, fat: fat, carbs: carbs, ppk: ppk, bmr: B, kg: kg, adaptive: ad };
+    var T = { ref: ref, source: source, offset: offset, kcal: kcal, protein: protein, fat: fat, carbs: carbs, ppk: ppk, bmr: B, kg: kg, adaptive: ad, model: mb, date: today, adj: 0 };
+    if (mb && mb.ok && P.goal !== 'maintain' && !(S.settings && S.settings.compensate === false)) {   // compensar excesos/defectos recientes, con límites
+      var co = root.MB.correction(S, Object.assign({}, ctx, { calib: mb.calib }), T, today); T.adj = co.adj; T.debt = co.debt; T.debtDays = co.days;
+    }
+    return T;
   }
 
   function strengthSessions(S, today, nDays) {
@@ -582,7 +588,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
   // Objetivo del DÍA: sigue a tu gasto real de ese día (más deporte → más margen), con el mismo déficit/superávit del plan y sin bajar del metabolismo basal
   function dayTarget(T, di) {
-    var kcal = Math.max(di.tdee + T.offset, T.bmr), fat = Math.max(0.8 * T.kg, 0.25 * kcal / 9), carbs = Math.max(0, (kcal - 4 * T.protein - 9 * fat) / 4);
+    var kcal = Math.max(di.tdee + T.offset + (di.date === T.date ? (T.adj || 0) : 0), T.bmr), fat = Math.max(0.8 * T.kg, 0.25 * kcal / 9), carbs = Math.max(0, (kcal - 4 * T.protein - 9 * fat) / 4);
     return Object.assign({}, T, { kcal: kcal, fat: fat, carbs: carbs, base: T.kcal, extra: kcal - T.kcal });
   }
 
@@ -1389,6 +1395,280 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
 
 </script>
 <script>
+/* Modelo bayesiano de tu cuerpo (filtro de Kalman). Módulo puro (sin DOM). Depende de CC. Global: MB.
+   Cada día estima a la vez, con su incertidumbre:
+     F  = tu peso «real» (tejido: grasa + músculo), sin agua ni contenido digestivo
+     M  = corrección de tu gasto respecto a la fórmula (kcal/día): metabolismo, NEAT, adaptación y sesgo de registro
+     D  = agua «residual» que va y viene (proceso AR(1))
+     β  = cuánto mueven TU báscula los hidratos, la comida del día, el gimnasio, pesarte sin ayunar, el sueño y cenar tarde
+   Proceso:  F(t+1) = F(t) + (ingesta − gasto_fórmula − M) / ρ          (ρ = kcal por kg, según tu % graso y si entrenas)
+   Medida:   báscula(t) = F + D + Σ β·x(t) + ruido                        (x = lo que pasó el día anterior)
+   El ruido de la báscula se aprende (Sage-Husa) y las pesadas raras se amortiguan (robusto). */
+(function (root) {
+  'use strict';
+  var C = (typeof module !== 'undefined' && module.exports) ? require('./calc.js') : root.CC;
+  var RHO_F = 9440, RHO_L = 1816;   // kcal por kg de grasa y de tejido magro (Hall 2008)
+  var ADAPT = 22;                   // kcal/día que cambia tu gasto por cada kg que cambias (Hall 2011, a largo plazo)
+  var PHI = 0.6, SD_D = 0.35;       // agua residual: persistencia de un día a otro y tamaño típico (kg)
+  var SD_M0 = 300, SD_M_DAY = 8;    // incertidumbre inicial de la fórmula y deriva diaria de tu metabolismo (kcal)
+  var SD_UNLOGGED = 550;            // un día sin registrar: no sé lo que comiste (kcal)
+  var BETAS = [
+    { k: 'carbs', m: 0.25, sd: 0.25, label: 'Hidratos del día anterior', unit: 'por cada 100 g por encima de lo habitual', why: 'El glucógeno se guarda con ~3 g de agua por gramo.' },
+    { k: 'food', m: 0.25, sd: 0.25, label: 'Comida del día anterior', unit: 'por cada 1.000 kcal por encima de lo habitual', why: 'Comida que aún está en el intestino.' },
+    { k: 'gym', m: 0.2, sd: 0.3, label: 'Entreno de fuerza el día anterior', unit: 'tras entrenar', why: 'El músculo entrenado retiene agua mientras se repara.' },
+    { k: 'fed', m: 0.5, sd: 0.4, label: 'Pesarte sin estar en ayunas', unit: 'si no es en ayunas', why: 'Comida y bebida del día.' },
+    { k: 'sleep', m: 0, sd: 0.15, label: 'Horas de sueño', unit: 'por cada hora más de sueño', why: 'Dormir poco sube el cortisol y la retención.' },
+    { k: 'late', m: 0.1, sd: 0.2, label: 'Cenar después de las 22:00', unit: 'si cenas tarde', why: 'Menos horas para digerir antes de pesarte.' }
+  ];
+  var NB = BETAS.length, N = 3 + NB;
+  var num = C.num, add = C.addDays, diff = C.diffDays;
+
+  /* ---------- álgebra mínima ---------- */
+  function zeros(n, m) { var a = []; for (var i = 0; i < n; i++) { a.push([]); for (var j = 0; j < m; j++) a[i].push(0); } return a; }
+  function eye(n) { var a = zeros(n, n); for (var i = 0; i < n; i++) a[i][i] = 1; return a; }
+  function mul(A, B) {
+    var n = A.length, m = B[0].length, k = B.length, R = zeros(n, m);
+    for (var i = 0; i < n; i++) for (var t = 0; t < k; t++) { var a = A[i][t]; if (!a) continue; for (var j = 0; j < m; j++) R[i][j] += a * B[t][j]; }
+    return R;
+  }
+  function tr(A) { var R = zeros(A[0].length, A.length); for (var i = 0; i < A.length; i++) for (var j = 0; j < A[0].length; j++) R[j][i] = A[i][j]; return R; }
+  function copyM(A) { return A.map(function (r) { return r.slice(); }); }
+  function sym(P) { for (var i = 0; i < P.length; i++) for (var j = 0; j < i; j++) { var v = (P[i][j] + P[j][i]) / 2; P[i][j] = v; P[j][i] = v; } return P; }
+  function dot(a, b) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+  function Pv(P, h) { return P.map(function (r) { return dot(r, h); }); }
+  function erf(x) { var s = x < 0 ? -1 : 1; x = Math.abs(x); var t = 1 / (1 + 0.3275911 * x); return s * (1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x)); }
+  function Phi(z) { return 0.5 * (1 + erf(z / Math.SQRT2)); }
+  function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+
+  /* ---------- tu cuerpo: grasa y densidad energética del cambio de peso ---------- */
+  function fatPct(P, kg) {
+    if (P.bodyFat > 3 && P.bodyFat < 60) return P.bodyFat;
+    var bmi = kg / Math.pow(P.height / 100, 2);                                // Deurenberg 1991
+    return clamp(1.2 * bmi + 0.23 * P.age - 10.8 * (P.sex === 'f' ? 0 : 1) - 5.4, 6, 50);
+  }
+  function rhoOf(S, kg, strength28) {
+    var P = S.profile, fm = kg * fatPct(P, kg) / 100;
+    var pL = 10.4 / (10.4 + fm);                                                // Forbes: parte del cambio que es magro
+    if (strength28 >= 6) pL = P.goal === 'gain' ? Math.max(pL, 0.5) : pL * 0.5;  // entrenar fuerza protege (o construye) músculo
+    return { rho: pL * RHO_L + (1 - pL) * RHO_F, lean: pL, fatPct: fatPct(P, kg) };
+  }
+
+  /* ---------- datos de cada día ---------- */
+  function isStrength(w) { return !!(w && (w.gym || (C.SPORTS[w.type] && C.SPORTS[w.type].strength) || w.type === 'pesas' || w.type === 'calis')); }
+  function dayFacts(S, d, f) {
+    var dd = (S.days || {})[d] || {}, di = C.dayInfo(S, d, f), last = 0;
+    (dd.meals || []).forEach(function (m) { var t = C.toMin(m.t); if (t != null && num(m.k) > C.FAST_BREAK && t > last) last = t; });
+    var sl = num(dd.sleep, 0) || (dd.health && num(dd.health.sleep, 0)) || 0;
+    var gym = (dd.workouts || []).some(isStrength) || ((dd.health && dd.health.workouts) || []).some(isStrength);
+    return { d: d, intake: di.intake, logged: di.logged, carbs: di.c, tf: di.tdee, ex: di.exercise, late: last >= 22 * 60 ? 1 : 0, sleep: sl > 0 ? sl : null, gym: gym ? 1 : 0, meals: di.meals };
+  }
+
+  // Regresores de la pesada del día d (lo que pasó el día anterior), relativos a lo habitual
+  function regressors(prev, today, w, hab) {
+    var x = [];
+    var ok = prev && prev.logged;
+    x.push(ok ? (prev.carbs - hab.carbs) / 100 : 0);
+    x.push(ok ? (prev.intake - hab.kcal) / 1000 : 0);
+    x.push(prev && prev.gym ? 1 : 0);
+    x.push(w && w.fasted === false ? 1 : 0);
+    x.push(today && today.sleep ? clamp(today.sleep - hab.sleep, -4, 4) : 0);
+    x.push(prev && prev.late ? 1 : 0);
+    return x;
+  }
+  function hvec(x) { return [1, 0, 1].concat(x); }
+
+  /* ---------- filtro ---------- */
+  function initState(S, kg0, hasW) {
+    var x = [kg0, 0, 0].concat(BETAS.map(function (b) { return b.m; }));
+    var P = zeros(N, N);
+    P[0][0] = hasW ? 0.6 * 0.6 : 2 * 2; P[1][1] = SD_M0 * SD_M0; P[2][2] = SD_D * SD_D;
+    BETAS.forEach(function (b, i) { P[3 + i][3 + i] = b.sd * b.sd; });
+    return { x: x, P: P };
+  }
+  // Un día: lo que comes menos lo que gastas mueve F; M deriva lento; el agua residual se va disipando
+  function predict(st, I, sdI, tf, rho) {
+    var A = eye(N); A[0][1] = -1 / rho; A[2][2] = PHI;
+    var x = st.x.slice();
+    x[0] = st.x[0] + (I - tf - st.x[1]) / rho; x[2] = PHI * st.x[2];
+    var P = mul(mul(A, st.P), tr(A));
+    P[0][0] += Math.pow(sdI / rho, 2) + 0.01 * 0.01;
+    P[1][1] += SD_M_DAY * SD_M_DAY;
+    P[2][2] += (1 - PHI * PHI) * SD_D * SD_D;
+    for (var i = 3; i < N; i++) P[i][i] += 0.004 * 0.004;                     // tus respuestas pueden cambiar muy despacio
+    return { x: x, P: sym(P) };
+  }
+  function measure(st, h, R) { var ph = Pv(st.P, h); return { mean: dot(h, st.x), S: dot(h, ph) + R, ph: ph }; }
+  function update(st, h, y, R) {
+    var m = measure(st, h, R), nu = y - m.mean, nis = nu * nu / m.S, Reff = R;
+    if (nis > 9) { Reff = R * nis / 9; m = measure(st, h, Reff); }            // pesada rara: se le da menos peso
+    var K = m.ph.map(function (v) { return v / m.S; });
+    var x = st.x.map(function (v, i) { return v + K[i] * nu; });
+    var P = copyM(st.P);
+    for (var i = 0; i < N; i++) for (var j = 0; j < N; j++) P[i][j] -= K[i] * m.ph[j];
+    return { st: { x: x, P: sym(P) }, nu: nu, S: m.S, nis: nis, robust: Reff > R };
+  }
+
+  function run(S, today, opt) {
+    opt = opt || {};
+    var ctx = C.makeCtx(S), f = Object.assign({}, ctx, { calib: 1 }), P0 = S.profile;
+    var wmap = {}; ctx.weights.forEach(function (w) { wmap[w.d] = w; });
+    var first = null, horizon = add(today, -(opt.maxDays || 400));
+    ctx.weights.forEach(function (w) { if (w.d >= horizon && (!first || w.d < first)) first = w.d; });
+    Object.keys(S.days || {}).forEach(function (d) { if (d >= horizon && d < today && C.dayInfo(S, d, f).logged && (!first || d < first)) first = d; });
+    if (!first) return { ok: false, reason: 'nodata' };
+
+    var kg0 = wmap[first] ? wmap[first].kg : ctx.weightAt(first);
+    var st = initState(S, kg0, !!wmap[first]);
+    var strength28 = 0; for (var i = 0; i < 28; i++) { var dd = (S.days || {})[add(today, -i)] || {}; if ((dd.workouts || []).some(isStrength) || ((dd.health && dd.health.workouts) || []).some(isStrength)) strength28++; }
+    var body = rhoOf(S, ctx.weightAt(today), strength28);                     // días con fuerza en 4 semanas
+    var rho = body.rho;
+
+    var R = 0.3 * 0.3, hab = { kcal: null, carbs: null, sleep: 7.5 }, nk = 0, ns = 0, sumK = 0, sumC = 0, sumS = 0;
+    var facts = {}, hist = [], preds = [], snaps = [], prev = null, ndays = diff(first, today);
+    function habit() { return { kcal: nk ? sumK / nk : (prev ? prev.tf : 2000), carbs: nk ? sumC / nk : 250, sleep: ns ? sumS / ns : 7.5 }; }
+
+    for (var k = 0; k <= ndays; k++) {
+      var d = add(first, k), fa = facts[d] = dayFacts(S, d, f);
+      if (new Date(C.parseYmd(d)).getDay() === 1) snaps.push({ d: d, st: { x: st.x.slice(), P: copyM(st.P) }, hab: habit() });
+      var w = wmap[d];
+      if (w) {
+        var hb = habit(), x = regressors(prev, fa, w, hb), h = hvec(x), m = measure(st, h, R);
+        var up = update(st, h, w.kg, R);
+        preds.push({ d: d, mean: m.mean, sd: Math.sqrt(m.S), y: w.kg, z: up.nu / Math.sqrt(up.S), robust: up.robust, x: x });
+        if (!up.robust) R = clamp(0.95 * R + 0.05 * Math.max(up.nu * up.nu - (up.S - R), 0.0025), 0.12 * 0.12, 0.9 * 0.9);
+        st = up.st;
+      }
+      if (fa.sleep) { ns++; sumS += fa.sleep; }
+      hist.push({ d: d, F: st.x[0], sdF: Math.sqrt(st.P[0][0]), M: st.x[1], sdM: Math.sqrt(st.P[1][1]), D: st.x[2], w: w ? w.kg : null });
+      if (d === today) break;
+      // Lo que comiste ese día
+      var I, sdI;
+      if (fa.logged) { I = fa.intake; sdI = 0.08 * fa.intake + 0.2 * fa.ex; nk++; sumK += fa.intake; sumC += fa.carbs; }
+      else { var hb2 = habit(); I = Math.max(fa.intake, hb2.kcal); sdI = SD_UNLOGGED; }
+      fa.I = I; fa.sdI = sdI;
+      st = predict(st, I, sdI, fa.tf, rho);
+      prev = fa;
+    }
+    var out = { ok: true, first: first, today: today, x: st.x, P: st.P, R: R, rho: rho, body: body, strength28: strength28, hist: hist, preds: preds, facts: facts, hab: habit(), ctx: ctx, f: f };
+    out.weeks = backtest(out, snaps, wmap);
+    return finish(S, out);
+  }
+
+  // Semana a semana: desde el estado de cada lunes, ¿qué pesada predecía para 7-9 días después con lo que comiste?
+  function backtest(o, snaps, wmap) {
+    var rows = [];
+    snaps.forEach(function (sn) {
+      var target = null;
+      for (var k = 7; k <= 9; k++) { var d = add(sn.d, k); if (wmap[d] && d <= o.today) { target = d; break; } }
+      if (!target) return;
+      var stM = { x: sn.st.x.slice(), P: copyM(sn.st.P) }, stF = { x: sn.st.x.slice(), P: copyM(sn.st.P) }, logged = 0;
+      stF.x[1] = 0;                                                            // «solo fórmula»: sin lo aprendido de tu gasto
+      for (var d = sn.d; d < target; d = add(d, 1)) {
+        var fa = o.facts[d]; if (!fa || fa.I == null) return;
+        if (fa.logged) logged++;
+        stM = predict(stM, fa.I, fa.sdI, fa.tf, o.rho); stF = predict(stF, fa.I, fa.sdI, fa.tf, o.rho);
+      }
+      if (logged < 4) return;
+      var h = hvec(regressors(o.facts[add(target, -1)], o.facts[target], wmap[target], sn.hab)), mm = measure(stM, h, o.R), mf = measure(stF, h, o.R);
+      var w0 = sn.st.x[0] + sn.st.x[2];
+      rows.push({ start: sn.d, end: target, pred: mm.mean, sd: Math.sqrt(mm.S), predFormula: mf.mean, y: wmap[target].kg, base: w0, err: wmap[target].kg - mm.mean, errFormula: wmap[target].kg - mf.mean, logged: logged });
+    });
+    return rows.reverse();
+  }
+
+  function mean(a) { return a.length ? a.reduce(function (s, x) { return s + x; }, 0) / a.length : null; }
+
+  function finish(S, o) {
+    var x = o.x, P = o.P, today = o.today;
+    // Gasto típico: media de la fórmula en tus últimos 14 días + lo aprendido
+    var tfs = []; for (var i = 1; i <= 14; i++) { var fa = o.facts[add(today, -i)]; if (fa) tfs.push(fa.tf); }
+    var tfTyp = tfs.length ? mean(tfs) : C.dayInfo(S, today, o.f).tdee;
+    o.formula = tfTyp; o.tdee = tfTyp + x[1]; o.sdTdee = Math.sqrt(P[1][1]);
+    o.learned = clamp(1 - o.sdTdee / SD_M0, 0, 1);                           // 0 = solo fórmula · 1 = medido de ti
+    o.calib = clamp(o.tdee / tfTyp, 0.7, 1.4);
+    o.F = x[0]; o.sdF = Math.sqrt(P[0][0]); o.noise = Math.sqrt(o.R);
+    o.betas = BETAS.map(function (b, i) {
+      var sd = Math.sqrt(P[3 + i][3 + i]);
+      return { k: b.k, label: b.label, unit: b.unit, why: b.why, mean: x[3 + i], sd: sd, prior: b.m, learned: clamp(1 - sd / b.sd, 0, 1), sure: Math.abs(x[3 + i]) > 1.64 * sd };
+    });
+    // Peso real hace 7/14/28 días → ritmo de verdad (sin agua)
+    function Fat(d) { var v = null; o.hist.forEach(function (hh) { if (hh.d <= d) v = hh; }); return v; }
+    o.rate = {}; [7, 14, 28].forEach(function (n) { var a = Fat(add(today, -n)); o.rate[n] = a && diff(o.first, today) >= n ? (o.F - a.F) * 7 / n : null; });
+    // Precisión real: pesadas predichas el día antes (sin usar esa pesada)
+    var pr = o.preds.slice(1).slice(-40);
+    o.acc = { n: pr.length, mae: pr.length ? mean(pr.map(function (p) { return Math.abs(p.y - p.mean); })) : null, in80: pr.filter(function (p) { return Math.abs(p.z) <= 1.2816; }).length };
+    var wk = o.weeks.slice(0, 8);
+    o.accWeek = { n: wk.length, mae: wk.length ? mean(wk.map(function (r) { return Math.abs(r.err); })) : null, maeFormula: wk.length ? mean(wk.map(function (r) { return Math.abs(r.errFormula); })) : null };
+    o.weighIns = o.preds.length;
+    o.logged = Object.keys(o.facts).filter(function (d) { return o.facts[d].logged && d < today; }).length;
+    return o;
+  }
+
+  /* ---------- predicciones ---------- */
+  // Previsión a N semanas comiendo `intake` kcal/día con una adherencia típica (±sdAdh): media y banda
+  function forecast(o, intake, weeks, goalKg, sdAdh) {
+    sdAdh = sdAdh == null ? 250 : sdAdh;
+    var st = { x: o.x.slice(), P: copyM(o.P) }, F0 = o.x[0], pts = [], reach = null, days = Math.round(weeks * 7);
+    for (var d = 1; d <= days; d++) {
+      var tf = o.formula + ADAPT * (st.x[0] - F0) * (o.formula / (o.formula + 0.0001));
+      st = predict(st, intake, sdAdh, tf, o.rho);
+      var m = st.x[0], sd = Math.sqrt(st.P[0][0]);
+      if (goalKg != null && reach === null && ((goalKg < F0 && m <= goalKg) || (goalKg > F0 && m >= goalKg))) reach = d;
+      if (d % 7 === 0) pts.push({ week: d / 7, kg: m, sd: sd, lo: m - 1.2816 * sd, hi: m + 1.2816 * sd });
+    }
+    return { pts: pts, end: pts.length ? pts[pts.length - 1].kg : F0, reachDays: reach };
+  }
+  // Probabilidad de estar en el objetivo en una fecha
+  function probGoal(o, intake, goalKg, days) {
+    var f = forecast(o, intake, Math.ceil(days / 7), null), p = f.pts[Math.max(0, Math.ceil(days / 7) - 1)];
+    if (!p) return null;
+    return goalKg < o.x[0] ? Phi((goalKg - p.kg) / p.sd) : 1 - Phi((goalKg - p.kg) / p.sd);
+  }
+  // Mañana por la mañana: ¿cuánto pesarás si hoy cierras en `intake` kcal? (incluye agua prevista)
+  function tomorrow(o, S, today, intake) {
+    var fa = o.facts[today] || dayFacts(S, today, o.f), tf = fa.tf;
+    var st = predict({ x: o.x.slice(), P: copyM(o.P) }, intake, 0.08 * intake + 0.2 * fa.ex, tf, o.rho);
+    var dayAs = Object.assign({}, fa, { intake: intake, logged: intake >= C.LOGGED_MIN, carbs: fa.intake > 0 ? fa.carbs * intake / fa.intake : o.hab.carbs });
+    var x = regressors(dayAs, null, { fasted: true }, o.hab), h = hvec(x), m = measure(st, h, o.R);
+    var parts = [{ k: 'real', label: 'Peso real', kg: st.x[0] }, { k: 'D', label: 'Agua residual', kg: st.x[2] }];
+    BETAS.forEach(function (b, i) { if (x[i]) parts.push({ k: b.k, label: b.label, kg: st.x[3 + i] * x[i] }); });
+    return { mean: m.mean, sd: Math.sqrt(m.S), lo: m.mean - 1.2816 * Math.sqrt(m.S), hi: m.mean + 1.2816 * Math.sqrt(m.S), tdee: tf + o.x[1], parts: parts, dF: st.x[0] - o.x[0] };
+  }
+  // Explica la última pesada: báscula = peso real + agua + efectos de ayer
+  function explain(o) {
+    var p = o.preds[o.preds.length - 1]; if (!p) return null;
+    var parts = [{ k: 'real', label: 'Peso real (tejido)', kg: o.x[0] }, { k: 'D', label: 'Agua que va y viene', kg: o.x[2] }];
+    BETAS.forEach(function (b, i) { if (p.x[i]) parts.push({ k: b.k, label: b.label, kg: o.x[3 + i] * p.x[i] }); });
+    return { d: p.d, y: p.y, expected: p.mean, sd: p.sd, z: p.z, parts: parts };
+  }
+
+  /* ---------- objetivo de hoy: compensa desvíos de los últimos días sin dramas ---------- */
+  // Suma lo que te has pasado (o quedado corto) los 6 días anteriores y lo reparte en 6 días, con límites (−250/+200 kcal).
+  function correction(S, ctx, T, today) {
+    var debt = 0, n = 0;
+    for (var i = 1; i <= 6; i++) {
+      var di = C.dayInfo(S, add(today, -i), ctx); if (!di.logged) continue;
+      var tk = Math.max(di.tdee + T.offset, T.bmr); debt += di.intake - tk; n++;
+    }
+    var adj = n ? clamp(-debt / 6, -250, 200) : 0;
+    return { adj: Math.round(adj / 10) * 10, debt: debt, days: n };
+  }
+
+  /* ---------- caché (se recalcula solo si cambian tus datos) ---------- */
+  var cache = { key: null, val: null };
+  function get(S, today) {
+    var key = (MB.rev || 0) + '|' + today + '|' + JSON.stringify(S.profile) + '|' + (S.weights || []).length + '|' + Object.keys(S.days || {}).length;
+    if (cache.key === key && cache.S === S) return cache.val;
+    var v; try { v = run(S, today); } catch (e) { v = { ok: false, reason: 'error', error: String(e && e.message || e) }; }
+    cache = { key: key, val: v, S: S };
+    return v;
+  }
+
+  var MB = { run: run, get: get, forecast: forecast, probGoal: probGoal, tomorrow: tomorrow, explain: explain, correction: correction, rhoOf: rhoOf, fatPct: fatPct, Phi: Phi, BETAS: BETAS, ADAPT: ADAPT, rev: 0 };
+  if (typeof module !== 'undefined' && module.exports) module.exports = MB; else root.MB = MB;
+})(typeof window !== 'undefined' ? window : this);
+</script>
+<script>
 (function () {
   'use strict';
   var CC = window.CC;
@@ -1462,6 +1742,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     return { days: days, gone: gone };
   }
   function applyDoc(key, d) {
+    if (window.MB) MB.rev++;
     if (key === 'core') {
       if (d.profile) S.profile = Object.assign(defaultState().profile, d.profile);
       S.weights = d.weights || []; S.favs = d.favs || [];
@@ -1480,6 +1761,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     (lsGet('months') || []).forEach(function (k) { var d = lsGet(k); if (d) applyDoc(k, d); });
   }
   function touch(key) {
+    if (window.MB) MB.rev++;
     var doc = buildDoc(key); doc.u = Date.now();
     lsSet(key, doc);
     if (key !== 'core') { var ms = lsGet('months') || []; if (ms.indexOf(key) < 0) { ms.push(key); lsSet('months', ms); } }
@@ -1753,7 +2035,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     }
     var ws = S.weights.slice().sort(function (a, b) { return a.d < b.d ? -1 : 1; }).filter(function (w) { return w.d >= CC.addDays(TODAY, -Math.max(n, 30)); }).map(function (w) { return w.d + ': ' + w.kg + ' kg'; });
     var ad = T.adaptive, M = CC.muscle(S, ctx, TODAY);
-    return { perfil: { sexo: P.sex === 'm' ? 'hombre' : 'mujer', edad: P.age, altura_cm: P.height, peso_kg: P.weight, grasa_pct: P.bodyFat, objetivo: P.goal, ritmo_kg_semana: P.rate }, objetivo_diario: { kcal: Math.round(T.kcal), prot: Math.round(T.protein), hc: Math.round(T.carbs), grasa: Math.round(T.fat) }, gasto_real_estimado: ad && ad.ok ? Math.round(ad.tdee) : null, musculo: M.ok ? { nivel: M.level, notas: M.msgs } : null, pesajes: ws, fuerza: gymReport(), ayuno: (function () { var st = CC.fastStats(S, ctx, TODAY, Math.max(n, 14), fastGoal()); return st ? { objetivo_h: st.goal, media_h: CC.round(st.avg, 1), dias_cumplidos: st.hit + '/' + st.n, ventana_media_h: st.window === null ? null : CC.round(st.window, 1), kcal_dias_con_ayuno: st.kcalFast === null ? null : Math.round(st.kcalFast), kcal_resto: st.kcalNot === null ? null : Math.round(st.kcalNot) } : null; })(), memoria: buildMemory(), dias: days };
+    return { perfil: { sexo: P.sex === 'm' ? 'hombre' : 'mujer', edad: P.age, altura_cm: P.height, peso_kg: P.weight, grasa_pct: P.bodyFat, objetivo: P.goal, ritmo_kg_semana: P.rate }, objetivo_diario: { kcal: Math.round(T.kcal), prot: Math.round(T.protein), hc: Math.round(T.carbs), grasa: Math.round(T.fat) }, gasto_real_estimado: ad && ad.ok ? Math.round(ad.tdee) : null, musculo: M.ok ? { nivel: M.level, notas: M.msgs } : null, pesajes: ws, fuerza: gymReport(), ayuno: (function () { var st = CC.fastStats(S, ctx, TODAY, Math.max(n, 14), fastGoal()); return st ? { objetivo_h: st.goal, media_h: CC.round(st.avg, 1), dias_cumplidos: st.hit + '/' + st.n, ventana_media_h: st.window === null ? null : CC.round(st.window, 1), kcal_dias_con_ayuno: st.kcalFast === null ? null : Math.round(st.kcalFast), kcal_resto: st.kcalNot === null ? null : Math.round(st.kcalNot) } : null; })(), memoria: buildMemory(), modelo_bayesiano: mbSummary(), dias: days };
   }
   async function makeReport() {
     if (V.rbusy) return;
@@ -1761,7 +2043,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     V.rbusy = true; V.rmsg = ''; render();
     try {
       var data = reportData(V.rdays);
-      var prompt = 'Eres un entrenador y dietista deportivo. Analiza los datos reales de esta persona de los últimos ' + V.rdays + ' días (JSON) y escribe un informe en español, claro y directo, tuteándola. Estructura con estos apartados en Markdown sencillo (títulos con ##, listas con -, **negrita**): ## Resumen, ## Peso y tendencia, ## Calorías y macros, ## Entrenamiento (si hay "fuerza": series por grupo muscular, mejores marcas y progresión; sugiere ajustes de volumen o progresión de cargas), ## Ayuno (solo si hay datos: horas, ventana de comida y si ayunar le ayuda a controlar las calorías; el café solo no rompe el ayuno), ## Qué mejorar esta semana (3-4 acciones concretas). Usa solo los datos dados, cita cifras, no inventes días sin registro (indícalo si faltan datos) y no des diagnósticos médicos. Usa también "memoria" (hábitos y aprendizajes previos) para comparar con lo anterior y no repetir consejos. Máximo 300 palabras. Además devuelve "aprendizajes": 2-4 frases cortas y duraderas sobre esta persona (hábitos, respuesta de su peso a las calorías, qué le funciona) que sirvan para informes futuros; actualiza o sustituye las previas si han cambiado. Responde ÚNICAMENTE con JSON: {"informe":"<markdown>","aprendizajes":["..."]}.\n\nDATOS:\n' + JSON.stringify(data);
+      var prompt = 'Eres un entrenador y dietista deportivo. Analiza los datos reales de esta persona de los últimos ' + V.rdays + ' días (JSON) y escribe un informe en español, claro y directo, tuteándola. Estructura con estos apartados en Markdown sencillo (títulos con ##, listas con -, **negrita**): ## Resumen, ## Peso y tendencia, ## Calorías y macros, ## Entrenamiento (si hay "fuerza": series por grupo muscular, mejores marcas y progresión; sugiere ajustes de volumen o progresión de cargas), ## Ayuno (solo si hay datos: horas, ventana de comida y si ayunar le ayuda a controlar las calorías; el café solo no rompe el ayuno), ## Qué mejorar esta semana (3-4 acciones concretas). Usa solo los datos dados, cita cifras, no inventes días sin registro (indícalo si faltan datos) y no des diagnósticos médicos. Usa también "memoria" (hábitos y aprendizajes previos) para comparar con lo anterior y no repetir consejos, y "modelo_bayesiano" (gasto real aprendido de sus datos, peso real sin agua y qué mueve su báscula) en vez de estimar tú el gasto. Máximo 300 palabras. Además devuelve "aprendizajes": 2-4 frases cortas y duraderas sobre esta persona (hábitos, respuesta de su peso a las calorías, qué le funciona) que sirvan para informes futuros; actualiza o sustituye las previas si han cambiado. Responde ÚNICAMENTE con JSON: {"informe":"<markdown>","aprendizajes":["..."]}.\n\nDATOS:\n' + JSON.stringify(data);
       var r = await aiJson(prompt);
       var txt = r && (r.informe || r.report || r.text);
       if (!txt) throw { code: 'parse' };
@@ -2048,7 +2330,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var remaining = T.kcal - di.intake, over = remaining < 0;
     h += '<div class="card hero"><div class="ringwrap">' + ringSvg(di.intake / T.kcal, over) + '<div class="ringc"><b>' + fmt(Math.abs(remaining)) + '</b><span>' + (over ? 'kcal de más' : 'kcal restantes') + '</span></div></div>' +
       '<div class="stats"><div class="stat"><span class="muted">Objetivo de hoy</span><b>' + fmt(T.kcal) + '</b></div><div class="stat"><span class="muted">Comido</span><b>' + fmt(di.intake) + '</b></div><div class="stat"><span class="muted">Ejercicio</span><b>' + fmt(di.exercise * di.calib) + '</b></div></div></div>' +
-      '<div class="tiny muted" style="margin:-4px 6px 10px;text-align:center">Tu objetivo se mueve con tu gasto de cada día: ' + fmt(di.tdee) + ' de gasto ' + (T.offset < 0 ? '− ' + fmt(-T.offset) + ' de déficit' : T.offset > 0 ? '+ ' + fmt(T.offset) + ' de superávit' : '(mantenimiento)') + (Math.abs(T.extra) >= 50 ? ' · ' + sgn(T.extra) + ' kcal frente a un día normal' : '') + '.</div>';
+      '<div class="tiny muted" style="margin:-4px 6px 10px;text-align:center">Tu objetivo se mueve con tu gasto de cada día: ' + fmt(di.tdee) + ' de gasto ' + (T.offset < 0 ? '− ' + fmt(-T.offset) + ' de déficit' : T.offset > 0 ? '+ ' + fmt(T.offset) + ' de superávit' : '(mantenimiento)') + (Math.abs(T.extra - (V.date === TODAY ? T.adj || 0 : 0)) >= 50 ? ' · ' + sgn(T.extra - (V.date === TODAY ? T.adj || 0 : 0)) + ' kcal por la actividad de hoy' : '') + (V.date === TODAY && T.adj ? ' · ' + sgn(T.adj) + ' para ' + (T.adj < 0 ? 'compensar lo que te pasaste' : 'recuperar lo que te faltó') + ' los últimos días' : '') + '.</div>';
 
     var isToday = V.date === TODAY;
     var endK = isToday ? Math.max(di.intake, T.kcal) : di.intake, bal = endK - di.tdee;
@@ -2061,6 +2343,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<details><summary>Ver cómo se calcula</summary><div class="kv"><span>Metabolismo + actividad diaria' + (di.source === 'salud' ? ' <span class="badge">Salud</span>' : '') + '</span><b>' + fmt(di.base * di.calib) + '</b></div><div class="kv"><span>Ejercicio</span><b>' + fmt(di.exercise * di.calib) + '</b></div>' +
       (di.calib !== 1 ? '<div class="tiny muted" style="margin-top:6px">Ajustado ×' + f2(di.calib) + ' según tu peso real de las últimas semanas.</div>' : '') + '</details></div>';
 
+    h += brainToday(T, di);
     h += fastCard(isToday);
 
     var tp = T.protein, macroK = di.p * 4 + di.c * 4 + di.f * 9;
@@ -2138,6 +2421,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     else if (k === 'gym' || k === 'gymview') el.innerHTML = gymHtml();
     else if (k === 'work') el.innerHTML = workHtml();
     else if (k === 'weight') el.innerHTML = weightHtml();
+    else if (k === 'chat') el.innerHTML = chatHtml();
   }
   function menuHtml() {
     return '<div class="menu" data-act="noop"><div class="handle"></div><div class="mgrid">' +
@@ -2146,6 +2430,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<button class="mbtn" data-act="m-gym"><span class="e">🏋️</span><b>Entreno de fuerza</b><span>Ejercicios, series y kcal</span></button>' +
       '<button class="mbtn" data-act="m-work"><span class="e">⚡</span><b>Deporte rápido</b><span>Correr, fútbol… + duración</span></button>' +
       '<button class="mbtn" data-act="m-weight"><span class="e">⚖️</span><b>Peso</b><span>Pésate en ayunas</span></button>' +
+      '<button class="mbtn" data-act="m-chef"><span class="e">🧑‍🍳</span><b>Chef y coach</b><span>Qué como con lo que tengo</span></button>' +
       (CG.gymWorkouts(S).length ? '<button class="mbtn" data-act="m-lastgym"><span class="e">🔁</span><b>Repetir último entreno</b><span>Mismos ejercicios</span></button>' : '') + '</div>' +
       '<p class="tiny muted" style="text-align:center;margin:12px 0 0">Se añadirá a <b>' + esc(shortDate(V.date)) + '</b></p></div>';
   }
@@ -2291,9 +2576,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       '<div><div class="mid">' + (w7 != null ? sgn(cur - w7, 1) : '—') + '</div><div class="muted tiny">últimos 7 días</div></div>' +
       '<div><div class="mid">' + (w28 != null ? sgn(cur - w28, 1) : '—') + '</div><div class="muted tiny">últimos 28 días</div></div></div>' +
       '<div class="readout" id="wread">' + esc(V.readout) + '</div>' + weightChart(ctx) + '</div>';
+    h += brainCard();
 
     var sm7 = CC.summary(S, ctx, TODAY, 7), sm14 = CC.summary(S, ctx, TODAY, 14);
-    h += cWeekly(T, ctx) + cTrend(T, ctx);
+    h += forecastCard(T) + cWeekly(T, ctx);
     h += '<div class="card"><h2>Balance diario (14 días)</h2><div class="readout" id="bread"></div>' + balanceChart(ctx) + '</div>';
 
     h += '<div class="card"><h2>¿Adelgazo o engordo?</h2>';
@@ -2302,23 +2588,10 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       var cls = sm7.cls, txt = cls === 'deficit' ? 'Estás en déficit calórico' : cls === 'superavit' ? 'Estás en superávit calórico' : 'Estás en mantenimiento';
       h += '<div class="mid ' + (cls === 'deficit' ? 'good' : cls === 'superavit' ? 'warn' : '') + '">' + txt + '</div>' +
         '<div class="small ink2" style="margin:4px 0 8px">Media de los últimos ' + sm7.days + ' día(s) registrados: comes <b>' + fmt(sm7.intake) + '</b> kcal y gastas <b>' + fmt(sm7.tdee) + '</b> → <b>' + sgn(sm7.balance) + ' kcal/día</b> ≈ <b>' + sgn(sm7.weeklyKg, 2) + ' kg/semana</b>.</div>';
-      var base = sm14 && sm14.days >= 5 ? sm14 : sm7, wk = base.weeklyKg;
-      h += '<h3>Proyección de peso con este ritmo</h3><table><tr><th></th><th>4 sem</th><th>8 sem</th><th>12 sem</th></tr><tr><td>Peso</td>' +
-        [4, 8, 12].map(function (n) { return '<td>' + f1(cur + wk * n) + ' kg</td>'; }).join('') + '</tr></table>' +
-        '<div class="tiny muted" style="margin-top:6px">Es una estimación lineal: con el tiempo el cuerpo se adapta y suele cambiar algo menos de lo previsto.</div>';
     }
     h += '</div>';
 
-    h += '<div class="card"><h2>Tu gasto real</h2>';
-    if (ad && ad.ok) {
-      h += '<div class="mid">≈ ' + fmt(ad.tdee) + ' kcal/día</div><div class="small ink2" style="margin:4px 0">Calculado con lo que has comido y cómo ha cambiado tu peso (' + ad.days + ' días registrados, ' + ad.weighIns + ' pesajes). La fórmula decía ' + fmt(ad.formula) + ' (' + sgn(ad.diff) + '). Confianza: <b>' + ad.conf + '</b>.</div>' +
-        '<div class="tiny muted">La app ajusta automáticamente tus balances con este valor' + (ad.conf === 'baja' ? ' cuando la confianza sea media o alta' : '') + '.</div>';
-    } else {
-      h += '<p class="small ink2">Con 4 semanas de comidas y pesajes, la app calcula tu gasto <b>real</b> (más fiable que cualquier fórmula). Llevas <b>' + (ad ? ad.days : 0) + '</b>/10 días registrados y <b>' + (ad ? ad.weighIns : 0) + '</b>/4 pesajes.</p>';
-    }
-    h += '</div>';
-
-    h += cLearn(ctx) + cCorr(ctx);
+    h += cCorr(ctx);
     var M = CC.muscle(S, ctx, TODAY);
     h += '<div class="card"><h2>¿Me pongo fuerte?</h2>';
     if (!M.ok) h += '<p class="small ink2">Registra al menos 3 días de comidas para evaluar proteína y energía. Entrenos de fuerza en los últimos 7 días: <b>' + M.sessions + '</b>.</p>';
@@ -2328,8 +2601,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     }
     h += '</div>';
 
-    h += '<div class="card"><h2>Objetivo recomendado</h2><div class="kv"><span>Gasto de referencia' + (T.source === 'real' ? ' <span class="badge">real</span>' : '') + '</span><b>' + fmt(T.ref) + ' kcal</b></div>' +
-      '<div class="kv"><span>Ajuste por objetivo</span><b>' + sgn(T.offset) + ' kcal</b></div>' +
+    h += '<div class="card"><h2>Objetivo recomendado</h2><div class="kv"><span>Gasto de referencia' + (T.source === 'real' ? ' <span class="badge">aprendido de ti</span>' : T.source === 'modelo' ? ' <span class="badge">modelo · aprendiendo</span>' : '') + '</span><b>' + fmt(T.ref) + ' kcal</b></div>' +
+      '<div class="kv"><span>Ajuste por objetivo</span><b>' + sgn(T.offset) + ' kcal</b></div>' + (T.adj ? '<div class="kv"><span>Compensación de los últimos días <span class="tiny muted">(solo hoy)</span></span><b>' + sgn(T.adj) + ' kcal</b></div>' : '') +
       '<div class="kv"><span><b>Come aproximadamente</b> <span class="tiny muted">(día normal; cada día se ajusta a tu ejercicio)</span></span><b>' + fmt(T.kcal) + ' kcal</b></div>' +
       '<div class="kv"><span>Proteína · Hidratos · Grasa</span><b>' + fmt(T.protein) + ' · ' + fmt(T.carbs) + ' · ' + fmt(T.fat) + ' g</b></div></div>';
 
@@ -2399,6 +2672,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (BUILD === 'web') h += '<div class="card"><h2>Instalar en el móvil</h2><ol class="small ink2" style="padding-left:20px;margin:0"><li>Abre esta web en <b>Safari</b> (iPhone) o Chrome (Android).</li><li>iPhone: botón <b>Compartir</b> → <b>Añadir a pantalla de inicio</b>. Android: menú ⋮ → <b>Instalar app</b>.</li><li>Ábrela desde el icono: funciona a pantalla completa, como una app.</li></ol></div>';
 
     h += '<div class="card"><h2>Mis rutinas de fuerza</h2>' + ((S.settings.routines || []).length ? S.settings.routines.map(function (r) { return '<div class="kv"><span>' + esc(r.name) + ' <span class="muted">· ' + r.exs.length + (r.exs.length === 1 ? ' ejercicio' : ' ejercicios') + '</span></span><button class="sm ghost danger" data-act="delroutine" data-id="' + r.id + '" aria-label="Borrar">✕</button></div>'; }).join('') : '<div class="small muted">Al terminar un entreno, pulsa «Guardar como rutina».</div>') + '</div>';
+    h += '<div class="card"><h2>🧑‍🍳 Chef y objetivos</h2><div class="field"><label>Gustos, alergias y lo que no comes (el chef lo respetará)</label><textarea data-bind="cgprefs" placeholder="Ej: no me gusta el pescado azul, intolerante a la lactosa, me encanta lo picante, cocino rápido entre semana">' + esc(S.settings.prefs || '') + '</textarea></div>' +
+      '<label class="row" style="color:var(--ink);font-size:15px;margin:0"><input type="checkbox" data-bind="cgcomp" style="width:22px;min-height:22px"' + (S.settings.compensate === false ? '' : ' checked') + '> Compensar los excesos (o defectos) de los últimos 6 días en el objetivo de hoy</label>' +
+      '<div class="tiny muted" style="margin-top:6px">Reparte lo que te pasaste entre 6 días, con un máximo de −250/+200 kcal al día y nunca por debajo de tu metabolismo basal. Así una cena grande no rompe la semana.</div></div>';
     h += cBackupHtml();
     return h;
   }
@@ -2521,7 +2797,9 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     saveweight: function () {
       var w = V.wt, kg = CC.num(w.kg);
       if (kg < 30 || kg > 300) { toast('Peso no válido'); return; }
-      addWeight(w.date || TODAY, kg, w.fasted); V.sheet = null; render(); toast('Peso guardado · ' + f1(kg) + ' kg');
+      addWeight(w.date || TODAY, kg, w.fasted); V.sheet = null; render();
+      var o = mbNow(), ex = o.ok ? MB.explain(o) : null;
+      toast(ex && ex.d === (w.date || TODAY) && o.preds.length > 1 ? 'Peso ' + f1(kg) + ' · esperaba ' + f1(ex.expected) + ' ± ' + f1(1.2816 * ex.sd) + ' · ' + verdictOf(ex.z, kg - ex.expected) : 'Peso guardado · ' + f1(kg) + ' kg');
     },
     wpt: function (t) {
       var p = ctxNow().trend.filter(function (x) { return x.d >= CC.addDays(TODAY, -60); })[+t.dataset.i]; if (!p) return;
@@ -2978,13 +3256,14 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     if (V.date !== TODAY) return '';
     var nm = CO.nextMeal(S, T, di, TODAY, nowMin(), 4); V._cn = nm;
     var h = '<div class="card"><h2 style="margin-bottom:2px">🍽️ Qué como ahora</h2>';
-    if (nm.over) return h + '<div class="small ink2" style="margin-top:6px">Ya has cubierto tu objetivo de hoy. Si aún tienes hambre, mejor algo ligero con proteína (yogur, claras, fruta).</div></div>';
+    if (nm.over) return h + '<div class="small ink2" style="margin-top:6px">Ya has cubierto tu objetivo de hoy. Si aún tienes hambre, mejor algo ligero con proteína (yogur, claras, fruta).</div><button class="ghost full" data-act="chef" style="margin-top:10px">🧑‍🍳 Pregúntale al chef qué picar</button></div>';
     h += '<div class="small ink2" style="margin:2px 0 10px">Te quedan <b>' + fmt(Math.max(0, nm.rem.k)) + '</b> kcal y <b>' + fmt(Math.max(0, nm.rem.p)) + '</b> g de proteína · ' + nm.left + (nm.left === 1 ? ' comida' : ' comidas') + ' por delante (≈ ' + fmt(nm.tgt.k) + ' kcal y ' + fmt(nm.tgt.p) + ' g cada una)</div>';
     if (!nm.list.length) h += '<div class="small muted">Registra unas cuantas comidas y aprenderé las que sueles hacer para proponértelas aquí.</div>';
     nm.list.forEach(function (c, i) {
       h += '<div class="kv" style="align-items:center"><div class="grow" style="min-width:0"><b>' + esc(c.name) + '</b>' + (c.kind === 'fav' ? ' <span class="badge">⭐</span>' : '') + '<div class="tiny muted">' + fmt(c.k) + ' kcal · P ' + fmt(c.p) + ' g' + (c.scale !== 1 ? ' · ración ×' + String(c.scale).replace('.', ',') : '') + ' · la has hecho ' + c.n + (c.n === 1 ? ' vez' : ' veces') + '</div></div><button class="sm primary" data-act="cadd" data-i="' + i + '">Añadir</button></div>';
     });
     if (S.favs.length) h += '<h3 style="margin-top:12px">⭐ Guardadas (un toque)</h3><div class="chips">' + S.favs.map(function (f) { return '<span class="chip" data-act="addfav" data-id="' + f.id + '">' + esc(f.name) + ' · ' + fmt(f.k) + '</span>'; }).join('') + '</div>';
+    h += '<button class="ghost full" data-act="chef" style="margin-top:12px">🧑‍🍳 Pregúntale al chef con lo que tienes en la nevera</button>';
     return h + '<div class="tiny muted" style="margin-top:8px">Sugerencias a partir de lo que ya comes, ajustando la ración a lo que te queda. Guarda tus combos con ⭐ al añadir una comida.</div></div>';
   }
 
@@ -3129,6 +3408,8 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
   Object.keys(COACH_ACTIONS).forEach(function (k) { ACTIONS[k] = COACH_ACTIONS[k]; });
   function cInput(t) {
     var b = t.dataset.bind;
+    if (b === 'cgprefs') { S.settings.prefs = String(t.value || '').slice(0, 600); touchCore(); return; }
+    if (b === 'cgcomp') { S.settings.compensate = !!t.checked; touchCore(); return; }
     if (b === 'cggoal') { var v = CC.num(t.value); S.profile.goalKg = v > 30 && v < 250 ? v : null; touchCore(); if (V.tab === 'progreso') { var y = window.scrollY; render(); window.scrollTo(0, y); } }
     else if (b === 'cgbkfile') {
       var f = t.files && t.files[0]; if (!f) return; var rd = new FileReader();
@@ -3159,6 +3440,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var t = e.target, b = t.dataset && t.dataset.bind; if (!b) return;
     if (b.indexOf('gy') === 0) { gInput(t); return; }
     if (b.indexOf('cg') === 0) return;
+    if (b === 'chatin') { if (V.chat) V.chat.input = t.value; return; }
     var d = V.draft;
     if (b === 'desc') d.desc = t.value;
     else if (b === 'name') { d.name = t.value; d.nameEdited = true; }
@@ -3183,6 +3465,7 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
       try { t.value = ''; } catch (x) {}
       d.busy = false; renderDraft(); return;
     }
+    if (t.id === 'chatPhotoIn' || t.id === 'frPhotoIn') { chatFileChange(t); return; }
     if (!b) return;
     if (b.indexOf('gy') === 0) { gInput(t); return; }
     if (b.indexOf('cg') === 0) { cInput(t); return; }
@@ -3205,6 +3488,278 @@ table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:6px 4px;
     var p = e.changedTouches[0], dx = p.clientX - tx, dy = p.clientY - ty;
     if (Date.now() - tt < 600 && Math.abs(dx) > 70 && Math.abs(dy) < 45) stepDay(dx > 0 ? -1 : 1);
   }, { passive: true });
+
+  /* ====================== CEREBRO: modelo bayesiano (interfaz) ====================== */
+  function mbNow() { return MB.get(S, TODAY); }
+  function pct(x) { return Math.round(x * 100) + ' %'; }
+  function knowBar(v) { return '<div class="meter" style="margin-top:6px" role="img" aria-label="Te conoce al ' + pct(v) + '"><i style="width:' + Math.max(3, Math.round(v * 100)) + '%;background:var(--s1)"></i></div>'; }
+  function lastWeighDays() { var ws = CC.makeCtx(S).weights; return ws.length ? CC.diffDays(ws[ws.length - 1].d, TODAY) : 999; }
+  function partsHtml(parts) {
+    var rows = parts.filter(function (p) { return p.k === 'real' || Math.abs(p.kg) >= 0.03; });
+    return '<div style="margin-top:6px">' + rows.map(function (p) {
+      return '<div class="kv"><span class="small">' + esc(p.label) + '</span><b class="small">' + (p.k === 'real' ? f1(p.kg) + ' kg' : cks(p.kg) + ' kg') + '</b></div>';
+    }).join('') + '</div>';
+  }
+  function verdictOf(z, d) { return Math.abs(z) <= 1.2816 ? 'dentro de lo esperado' : d > 0 ? 'más de lo esperado' : 'menos de lo esperado'; }
+
+  /* ---- Hoy: tu cuerpo hoy y mañana ---- */
+  function brainToday(T, di) {
+    if (V.date !== TODAY) return '';
+    var o = mbNow(); if (!o.ok) return '';
+    var h = '<div class="card"><div class="row sp"><h2 style="margin:0">🧠 Tu cuerpo hoy</h2><span class="tiny muted">te conoce al ' + pct(o.learned) + '</span></div>' + knowBar(o.learned);
+    var ex = MB.explain(o);
+    if (ex && ex.d === TODAY && o.preds.length > 1) {
+      var dv = ex.y - ex.expected;
+      h += '<div class="small ink2" style="margin-top:10px">⚖️ Hoy has pesado <b>' + f1(ex.y) + ' kg</b>. Esperaba <b>' + f1(ex.expected) + ' ± ' + f1(1.2816 * ex.sd) + '</b>: ' + verdictOf(ex.z, dv) + (Math.abs(ex.z) > 1.2816 ? (dv > 0 ? '. Casi seguro que es agua; mira mañana.' : '. Buena señal, pero confírmalo mañana.') : '.') + '</div>';
+      h += '<details><summary class="small">Qué hay en ese ' + f1(ex.y) + '</summary>' + partsHtml(ex.parts) + '<div class="tiny muted">El agua y la comida van y vienen; solo el «peso real» es grasa y músculo.</div></details>';
+    }
+    var close = Math.max(di.intake, T.kcal), tm = MB.tomorrow(o, S, TODAY, close);
+    h += '<div class="small ink2" style="margin-top:10px">🔮 <b>Mañana</b>, si cierras hoy en ' + fmt(close) + ' kcal' + (di.intake > T.kcal ? ' (lo que llevas)' : ' (tu objetivo)') + ': <b>' + f1(tm.mean) + ' kg</b> <span class="muted">(80 %: ' + f1(tm.lo) + ' – ' + f1(tm.hi) + ')</span>. Tu peso real cambiaría ' + cks(tm.dF) + ' kg; el resto es agua.</div>';
+    var ld = lastWeighDays();
+    if (ld >= 1) h += '<div class="banner" style="margin:10px 0 0">📌 ' + (ld >= 999 ? 'Pésate' : ld === 1 ? 'Aún no te has pesado hoy. Pésate' : 'Llevas ' + ld + ' días sin pesarte. Pésate') + ' en ayunas: con cada pesada afino tu gasto real (ahora ± ' + fmt(o.sdTdee) + ' kcal).<br><button class="sm primary" data-act="m-weight" style="margin-top:8px">⚖️ Registrar peso</button></div>';
+    return h + '</div>';
+  }
+
+  /* ---- Progreso: el modelo por dentro ---- */
+  function brainCard() {
+    var o = mbNow(), h = '<div class="card"><h2>🧠 Tu cuerpo según el modelo</h2>';
+    if (!o.ok) return h + '<p class="small ink2">Registra comidas y pésate unos días: empezaré a aprender cómo funciona tu cuerpo.</p></div>';
+    h += '<div class="small ink2" style="margin-top:-4px">Te conoce al <b>' + pct(o.learned) + '</b> · ' + o.logged + ' días registrados · ' + o.weighIns + ' pesadas</div>' + knowBar(o.learned);
+    var r = o.weighIns < 5 ? null : o.rate[14] != null ? o.rate[14] : o.rate[7];
+    h += '<div class="grid3" style="margin:12px 0 6px"><div><div class="mid">' + fmt(o.tdee) + '</div><div class="muted tiny">kcal/día que gastas (± ' + fmt(o.sdTdee) + ')</div></div>' +
+      '<div><div class="mid">' + f1(o.F) + '</div><div class="muted tiny">kg reales, sin agua (± ' + f1(o.sdF) + ')</div></div>' +
+      '<div><div class="mid">' + (r != null ? cks(r) : '—') + '</div><div class="muted tiny">kg/semana reales</div></div></div>';
+    var gap = o.tdee - o.formula;
+    h += '<div class="small ink2">' + (o.learned < 0.25 ? 'Aún me baso sobre todo en la fórmula (' + fmt(o.formula) + ' kcal). Cada día registrado y cada pesada me acercan a tu gasto de verdad.'
+      : 'La fórmula decía ' + fmt(o.formula) + ' kcal; con tus datos veo que gastas ' + (Math.abs(gap) < 50 ? 'prácticamente eso' : fmt(Math.abs(gap)) + ' kcal ' + (gap > 0 ? 'más' : 'menos')) + '. Ese número ya incluye tu metabolismo, lo que te mueves y lo que se escapa al registrar, así que tus objetivos se ajustan solos.') + '</div>';
+    h += '<div class="small ink2" style="margin-top:6px">Ahora mismo cada kilo que cambias son unas <b>' + fmt(o.rho) + ' kcal</b> (≈ ' + Math.round((1 - o.body.lean) * 100) + ' % grasa). ' + (o.strength28 < 6 ? 'Con 2 o más sesiones de fuerza por semana protegerías más músculo al bajar.' : 'Como entrenas fuerza, casi todo lo que pierdes es grasa.') + '</div>';
+
+    h += '<h3>Lo que mueve tu báscula (aprendido de ti)</h3>';
+    o.betas.forEach(function (b) {
+      var st = b.learned < 0.3 ? 'aprendiendo' : b.sure ? 'seguro' : 'poco efecto';
+      h += '<div class="kv" style="align-items:center"><div class="grow" style="min-width:0"><b class="small">' + esc(b.label) + '</b><div class="tiny muted">' + esc(cap(b.unit)) + '. ' + esc(b.why) + '</div><div class="meter" style="margin-top:4px;height:4px"><i style="width:' + Math.max(3, Math.round(b.learned * 100)) + '%;background:var(--s3)"></i></div></div>' +
+        '<div style="text-align:right;flex:none;padding-left:10px"><b class="small">' + cks(b.mean) + ' kg</b><div class="tiny ' + (st === 'seguro' ? 'good' : 'muted') + '">' + st + '</div></div></div>';
+    });
+    h += '<div class="tiny muted" style="margin-top:6px">Aparte de eso, tu báscula oscila unos ± ' + f1(o.noise) + ' kg al azar de un día a otro. Por eso una pesada sola no dice nada y la tendencia sí.</div>';
+
+    h += '<h3>¿Acierta?</h3>';
+    if (o.acc.n) h += '<div class="small ink2">He predicho <b>' + o.acc.n + '</b> pesada' + (o.acc.n === 1 ? '' : 's') + ' el día antes, sin verla' + (o.acc.n === 1 ? '' : 's') + ': error medio <b>' + f2(o.acc.mae) + ' kg</b>; ' + o.acc.in80 + ' de ' + o.acc.n + ' cayeron dentro de mi margen del 80 %' + (o.acc.n >= 10 ? (o.acc.in80 / o.acc.n >= 0.7 ? ' (bien calibrado).' : ' (aún afinando).') : '.') + '</div>';
+    else h += '<div class="small ink2">Cuando te peses unos días seguidos verás aquí cuánto acierto, prediciendo cada pesada antes de verla.</div>';
+    if (o.weeks.length) {
+      h += '<table style="margin-top:8px"><tr><th>Semana</th><th>Previsto</th><th>Real</th><th>Error</th></tr>';
+      o.weeks.slice(0, 6).forEach(function (w) { h += '<tr><td>' + dmy(w.start) + '</td><td>' + f1(w.pred) + '</td><td>' + f1(w.y) + '</td><td class="' + (Math.abs(w.err) <= 1.2816 * w.sd ? 'good' : 'warn') + '">' + cks(w.err) + '</td></tr>'; });
+      h += '</table>';
+      if (o.accWeek.n >= 2) h += '<div class="tiny muted" style="margin-top:6px">Error medio a 7 días: <b>' + f2(o.accWeek.mae) + ' kg</b> con lo aprendido de ti frente a ' + f2(o.accWeek.maeFormula) + ' kg con la fórmula sola. Cada lunes predigo tu pesada de la semana siguiente sin mirarla.</div>';
+    }
+    return h + '<div class="tiny muted" style="margin-top:8px">Modelo bayesiano (filtro de Kalman): cada día combina lo que comes, tu gasto según Salud y la fórmula, y tus pesadas; separa grasa de agua y te da siempre un margen de error honesto.</div></div>';
+  }
+
+  /* ---- Progreso: previsión con bandas ---- */
+  function fcChart(series, goal, F0) {
+    var W = 520, H = 220, L = 40, R = 14, Tp = 12, B = 26, weeks = series[0].f.pts.length, lo = Infinity, hi = -Infinity;
+    series.forEach(function (s) { s.f.pts.forEach(function (p) { lo = Math.min(lo, p.lo); hi = Math.max(hi, p.hi); }); });
+    lo = Math.min(lo, F0, goal != null ? goal : Infinity); hi = Math.max(hi, F0, goal != null ? goal : -Infinity);
+    lo = Math.floor(lo - 0.3); hi = Math.ceil(hi + 0.3);
+    function X(w) { return L + (W - L - R) * w / weeks; }
+    function Y(v) { return Tp + (H - Tp - B) * (1 - (v - lo) / (hi - lo)); }
+    var g = '', i;
+    for (i = 0; i <= 4; i++) { var v = lo + (hi - lo) * i / 4; g += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + Y(v) + '" y2="' + Y(v) + '" stroke="var(--grid)"/><text x="' + (L - 6) + '" y="' + (Y(v) + 4) + '" font-size="11" text-anchor="end">' + f1(v) + '</text>'; }
+    series.forEach(function (s) {
+      var up = 'M' + X(0) + ',' + Y(F0) + s.f.pts.map(function (p) { return 'L' + X(p.week).toFixed(1) + ',' + Y(p.hi).toFixed(1); }).join('');
+      var dn = s.f.pts.slice().reverse().map(function (p) { return 'L' + X(p.week).toFixed(1) + ',' + Y(p.lo).toFixed(1); }).join('');
+      g += '<path d="' + up + dn + 'Z" fill="' + s.c + '" opacity=".14"/>';
+      g += '<path d="M' + X(0) + ',' + Y(F0) + s.f.pts.map(function (p) { return 'L' + X(p.week).toFixed(1) + ',' + Y(p.kg).toFixed(1); }).join('') + '" fill="none" stroke="' + s.c + '" stroke-width="2"' + (s.dash ? ' stroke-dasharray="5 4"' : '') + '/>';
+    });
+    if (goal != null) g += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + Y(goal) + '" y2="' + Y(goal) + '" stroke="var(--s2)" stroke-dasharray="3 4"/><text x="' + (W - R) + '" y="' + (Y(goal) - 4) + '" font-size="11" text-anchor="end">meta ' + f1(goal) + '</text>';
+    g += '<text x="' + L + '" y="' + (H - 6) + '" font-size="11">hoy</text><text x="' + (W - R) + '" y="' + (H - 6) + '" font-size="11" text-anchor="end">' + weeks + ' sem</text>';
+    return '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Previsión de peso">' + g + '</svg><div class="legend">' + series.map(function (s) { return '<span><i class="dot" style="background:' + s.c + '"></i>' + esc(s.label) + '</span>'; }).join('') + '<span class="muted">sombreado: 80 % probable</span></div>';
+  }
+  function forecastCard(T) {
+    var o = mbNow(), P = S.profile, h = '<div class="card"><h2>🔮 Previsión</h2>';
+    if (!o.ok) return h + '<p class="small ink2">Necesito algún día registrado y una pesada para prever tu peso.</p>' + cGoalField(P) + '</div>';
+    var goal = P.goalKg > 30 ? P.goalKg : null, sm = CC.summary(S, ctxNow(), TODAY, 14), eat = sm && sm.days >= 4 ? sm.intake : null;
+    var weeks = 16, plan = { f: MB.forecast(o, T.kcal, weeks, goal), c: 'var(--s1)', label: 'Con tu objetivo (' + fmt(T.kcal) + ')' }, series = [plan];
+    if (eat && Math.abs(eat - T.kcal) > 60) series.push({ f: MB.forecast(o, eat, weeks, goal), c: 'var(--s2)', label: 'Como comes ahora (' + fmt(eat) + ')', dash: true });
+    h += fcChart(series, goal, o.F);
+    h += '<table style="margin-top:8px"><tr><th></th>' + [4, 8, 12, 16].map(function (n) { return '<th>' + n + ' sem</th>'; }).join('') + '</tr>' + series.map(function (s) {
+      return '<tr><td class="small">' + esc(s.label.split(' (')[0]) + '</td>' + [4, 8, 12, 16].map(function (n) { var p = s.f.pts[n - 1]; return '<td>' + f1(p.kg) + '<div class="tiny muted">' + f1(p.lo) + '–' + f1(p.hi) + '</div></td>'; }).join('') + '</tr>';
+    }).join('') + '</table>';
+    if (goal) {
+      series.forEach(function (s) {
+        var lab = s.label.split(' (')[0].toLowerCase(), d = s.f.reachDays;
+        var p12 = MB.probGoal(o, s === plan ? T.kcal : eat, goal, 84);
+        h += '<div class="small ink2" style="margin-top:6px">🎯 ' + esc(cap(lab)) + ': ' + (d ? 'llegas a ' + f1(goal) + ' kg hacia el <b>' + cdate(CC.addDays(TODAY, d)) + '</b> (≈ ' + Math.ceil(d / 7) + ' semanas)' : 'no llegas a ' + f1(goal) + ' kg en ' + weeks + ' semanas') + (p12 != null ? ' · probabilidad de estar ya ahí en 12 semanas: <b>' + Math.round(p12 * 100) + ' %</b>' : '') + '.</div>';
+      });
+    }
+    h += cGoalField(P);
+    return h + '<div class="tiny muted" style="margin-top:6px">Tiene en cuenta que al bajar de peso gastas menos (≈ ' + MB.ADAPT + ' kcal/día por kg), lo que ya sabe de tu gasto y su incertidumbre, y que no todos los días se clavan las calorías.</div></div>';
+  }
+  function mbSummary() {
+    var o = mbNow(); if (!o.ok) return null;
+    return { gasto_real_kcal: Math.round(o.tdee), margen_kcal: Math.round(o.sdTdee), gasto_formula_kcal: Math.round(o.formula), conocimiento: pct(o.learned), peso_real_sin_agua: CC.round(o.F, 1), ritmo_real_kg_semana: o.rate[14] != null ? CC.round(o.rate[14], 2) : (o.rate[7] != null ? CC.round(o.rate[7], 2) : null),
+      ruido_bascula_kg: CC.round(o.noise, 2), kcal_por_kg: Math.round(o.rho), efectos_bascula: o.betas.filter(function (b) { return b.learned >= 0.3; }).map(function (b) { return b.label + ': ' + CC.round(b.mean, 2) + ' kg ' + b.unit; }),
+      precision: o.acc.n ? { pesadas_predichas: o.acc.n, error_medio_kg: CC.round(o.acc.mae, 2), dentro_margen_80: o.acc.in80 } : null };
+  }
+
+  /* ====================== CHEF Y COACH (chat) ====================== */
+  var QUICK = ['¿Qué como ahora con lo que tengo?', 'Planifícame el resto del día', 'Algo dulce que encaje', 'Voy a comer fuera: ¿qué pido?', '¿Por qué ha cambiado mi peso?', '¿Cómo voy esta semana?'];
+  function chatLog() { return lsGet('chat') || []; }
+  function chatSave(l) { lsSet('chat', l.slice(-40)); }
+  function fridge() { return S.settings.fridge || []; }
+  function setFridge(list) {
+    var seen = {}, out = [];
+    list.forEach(function (n) { n = String(n || '').replace(/\s+/g, ' ').trim(); var k = n.toLowerCase(); if (n && n.length <= 60 && !seen[k]) { seen[k] = 1; out.push(n); } });
+    S.settings.fridge = out.slice(0, 80); touchCore();
+  }
+  function openChat(q) {
+    V.chat = V.chat || { busy: false, err: '', input: '', photo: null, showFridge: false, frbusy: false };
+    if (!fridge().length && !chatLog().length) V.chat.showFridge = true;
+    if (q) V.chat.input = q;
+    openSheet('chat'); if (chatLog().length) scrollChat();
+  }
+  function scrollChat() { setTimeout(function () { var el = $('#sheet'); if (el && V.sheet === 'chat') el.scrollTop = el.scrollHeight; }, 30); }
+  function todayLeft() {
+    var ctx = ctxNow(), di = CC.dayInfo(S, TODAY, ctx), T0 = CC.targets(S, ctx, TODAY), T = CC.dayTarget(T0, di);
+    return { ctx: ctx, di: di, T0: T0, T: T, rem: { k: T.kcal - di.intake, p: T.protein - di.p, c: T.carbs - di.c, f: T.fat - di.f } };
+  }
+  function optHtml(o, i, j) {
+    var h = '<div style="border-top:1px solid var(--ring);margin-top:10px;padding-top:10px"><div class="row sp" style="align-items:flex-start"><div class="grow" style="min-width:0"><b>' + esc(o.name) + '</b> <span class="badge">' + esc(o.type) + '</span>' +
+      '<div class="tiny muted">' + fmt(o.k) + ' kcal · P ' + fmt(o.p) + ' · HC ' + fmt(o.c) + ' · G ' + fmt(o.f) + ' g</div></div>' +
+      (o.added ? '<span class="small good">✓ Añadida</span>' : '<button class="sm primary" data-act="chatadd" data-i="' + i + '" data-j="' + j + '">Añadir a hoy</button>') + '</div>';
+    if (o.why) h += '<div class="small ink2" style="margin-top:4px">' + esc(o.why) + '</div>';
+    h += '<details><summary class="small">Ingredientes' + (o.steps.length ? ' y receta' : '') + '</summary><ul class="small ink2" style="padding-left:18px;margin:6px 0">' + o.items.map(function (it) { return '<li>' + esc(it.n) + ' · ' + fmt(it.g) + ' g · ' + fmt(it.k) + ' kcal</li>'; }).join('') + '</ul>' +
+      (o.steps.length ? '<ol class="small ink2" style="padding-left:18px;margin:6px 0">' + o.steps.map(function (s) { return '<li style="margin:3px 0">' + esc(s) + '</li>'; }).join('') + '</ol>' : '') + '</details>';
+    return h + '</div>';
+  }
+  function chatHtml() {
+    var c = V.chat, log = chatLog(), L = todayLeft(), fr = fridge();
+    var h = '<div class="sheetin"><div class="stop"><button class="ghost" data-act="closesheet">Cerrar</button><h1>🧑‍🍳 Chef y coach</h1><button class="ghost" data-act="chatclear"' + (log.length ? '' : ' disabled') + '>Borrar</button></div>';
+    h += '<div class="card small ink2" style="margin-bottom:10px">Hoy te quedan <b>' + fmt(Math.max(0, L.rem.k)) + ' kcal</b>' + (L.rem.k < 0 ? ' (te has pasado ' + fmt(-L.rem.k) + ')' : '') + ' · proteína ' + fmt(Math.max(0, L.rem.p)) + ' g · hidratos ' + fmt(Math.max(0, L.rem.c)) + ' g · grasa ' + fmt(Math.max(0, L.rem.f)) + ' g</div>';
+    h += '<div class="card"><div class="row sp"><b>🧊 Mi nevera y despensa</b><button class="sm ghost" data-act="chatfridge">' + (c.showFridge ? 'Ocultar' : fr.length ? fr.length + (fr.length === 1 ? ' cosa' : ' cosas') + ' · editar' : 'Añadir') + '</button></div>';
+    if (c.showFridge) {
+      h += fr.length ? '<div class="chips" style="margin-top:8px">' + fr.map(function (n, i) { return '<span class="chip" data-act="frdel" data-i="' + i + '" aria-label="Quitar ' + esc(n) + '">' + esc(n) + ' <span class="muted">✕</span></span>'; }).join('') + '</div>' : '<div class="small muted" style="margin-top:6px">Vacía. Escribe lo que tienes o hazle una foto a la nevera.</div>';
+      h += '<div class="row" style="margin-top:8px;gap:8px"><input id="frin" placeholder="huevos, pechuga, arroz, yogur griego…" style="flex:1"><button class="sm primary" data-act="fradd">Añadir</button></div>' +
+        '<div class="row" style="margin-top:8px;gap:8px"><button class="sm ghost" data-act="frphoto"' + (c.frbusy ? ' disabled' : '') + '>' + (c.frbusy ? 'Mirando la foto…' : '📷 Foto de la nevera') + '</button>' + (fr.length ? '<button class="sm ghost danger" data-act="frclear">Vaciar</button>' : '') + '</div>' +
+        '<input type="file" id="frPhotoIn" accept="image/*" class="hide"><div class="tiny muted" style="margin-top:6px">Se guarda y se sincroniza. También puedes decirle al chef «se me han acabado los huevos» o «he comprado salmón».</div>';
+    }
+    h += '</div>';
+    if (!log.length) h += '<div class="card small ink2">Pregúntame lo que quieras: qué comer con lo que tienes, cómo cuadrar el resto del día, qué pedir en un restaurante o por qué ha cambiado la báscula. Sé lo que te queda hoy, tu gasto real y lo que sueles comer.</div>';
+    log.forEach(function (m, i) {
+      if (m.r === 'u') { h += '<div style="text-align:right;margin:10px 0"><span class="small" style="display:inline-block;text-align:left;background:var(--s1-track);color:var(--ink);padding:9px 13px;border-radius:16px 16px 4px 16px;max-width:85%">' + esc(m.t) + (m.ph ? ' 📷' : '') + '</span></div>'; return; }
+      h += '<div class="card" style="border-left:4px solid var(--s1)">' + mdLite(m.t) + (m.opts || []).map(function (o, j) { return optHtml(o, i, j); }).join('') +
+        (m.fr && (m.fr.add.length || m.fr.del.length) ? '<div class="tiny muted" style="margin-top:8px">🧊 Nevera actualizada' + (m.fr.add.length ? ' · +' + esc(m.fr.add.join(', ')) : '') + (m.fr.del.length ? ' · −' + esc(m.fr.del.join(', ')) : '') + '</div>' : '') + '</div>';
+    });
+    if (c.busy) h += '<div class="card small muted">Pensando…</div>';
+    if (c.err) h += '<div class="small bad" style="margin:8px 0">' + esc(c.err) + '</div>';
+    h += '<div class="chips" style="margin:12px -14px;padding:0 14px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch">' + QUICK.map(function (q, i) { return '<span class="chip" style="white-space:nowrap;flex:none;font-size:13.5px" data-act="chatq" data-i="' + i + '">' + esc(q) + '</span>'; }).join('') + '</div>';
+    h += '<input type="file" id="chatPhotoIn" accept="image/*" class="hide"></div>';
+    h += '<div class="sbar"><div><button class="ghost" data-act="chatphoto" style="min-width:48px;padding:0 10px" aria-label="Adjuntar foto">' + (c.photo ? '🖼️' : '📷') + '</button>' +
+      '<textarea id="chatin" data-bind="chatin" style="min-height:44px;height:44px;flex:1" placeholder="' + (c.photo ? 'Foto lista. Pregunta algo…' : 'Pregunta al chef…') + '">' + esc(c.input) + '</textarea>' +
+      '<button class="primary" data-act="chatsend" style="min-width:76px"' + (c.busy ? ' disabled' : '') + '>Enviar</button></div></div>';
+    return h;
+  }
+  function chatContext() {
+    var L = todayLeft(), o = mbNow(), P = S.profile, nm = nowMin(), day = S.days[TODAY] || {}, last7 = [];
+    for (var i = 7; i >= 1; i--) { var d = CC.addDays(TODAY, -i), x = CC.dayInfo(S, d, L.ctx); last7.push({ fecha: d, kcal: x.logged ? Math.round(x.intake) : 'sin registrar', prot: x.logged ? Math.round(x.p) : null, objetivo: Math.round(CC.dayTarget(L.T0, x).kcal) }); }
+    var tm = o.ok ? MB.tomorrow(o, S, TODAY, Math.max(L.di.intake, L.T.kcal)) : null, ex = o.ok ? MB.explain(o) : null, mem = buildMemory();
+    return {
+      ahora: { fecha: TODAY, dia: DOW[CC.parseYmd(TODAY).getDay()], hora: CC.hm(nm), comidas_por_delante: CO.mealsLeft(nm) },
+      perfil: { sexo: P.sex === 'm' ? 'hombre' : 'mujer', edad: P.age, altura_cm: P.height, objetivo: P.goal, ritmo_kg_semana: P.rate, peso_objetivo: P.goalKg || null },
+      hoy: { objetivo: { kcal: Math.round(L.T.kcal), prot: Math.round(L.T.protein), hc: Math.round(L.T.carbs), grasa: Math.round(L.T.fat) }, comido: { kcal: Math.round(L.di.intake), prot: Math.round(L.di.p), hc: Math.round(L.di.c), grasa: Math.round(L.di.f) },
+        queda: { kcal: Math.round(L.rem.k), prot: Math.round(L.rem.p), hc: Math.round(L.rem.c), grasa: Math.round(L.rem.f) }, compensacion_kcal: L.T.adj || 0,
+        comidas: (day.meals || []).map(function (m) { return (m.t || '') + ' ' + m.type + ': ' + m.name + ' (' + Math.round(m.k) + ' kcal, P ' + Math.round(m.p) + ')'; }),
+        entrenos: (day.workouts || []).map(function (w) { return (w.name || w.type) + ' ' + (w.min || '') + ' min'; }) },
+      modelo: o.ok ? Object.assign(mbSummary(), { prevision_manana_kg: tm ? CC.round(tm.mean, 1) + ' (80%: ' + CC.round(tm.lo, 1) + '-' + CC.round(tm.hi, 1) + ')' : null,
+        ultima_pesada: ex ? { fecha: ex.d, pesaste: ex.y, esperado: CC.round(ex.expected, 1), desglose: ex.parts.map(function (p) { return p.label + ' ' + CC.round(p.kg, 2); }) } : null }) : null,
+      ultimos_7_dias: last7, pesadas: CC.makeCtx(S).weights.slice(-10).map(function (w) { return w.d + ': ' + w.kg + ' kg' + (w.fasted === false ? ' (no en ayunas)' : ''); }),
+      nevera: fridge(), gustos_y_restricciones: S.settings.prefs || '', alimentos_habituales: mem.alimentos_habituales.slice(0, 15), aprendizajes: (S.memory && S.memory.notes) || []
+    };
+  }
+  function chatPrompt(text, log, hasPhoto) {
+    var hist = log.slice(-9, -1).map(function (m) { return (m.r === 'u' ? 'PERSONA: ' : 'TÚ: ') + String(m.t).slice(0, 500) + (m.opts && m.opts.length ? ' [propusiste: ' + m.opts.map(function (o) { return o.name + ' ' + o.k + ' kcal' + (o.added ? ' (la añadió)' : ''); }).join('; ') + ']' : ''); }).join('\n');
+    return 'Eres el chef y entrenador personal de esta persona: nutricionista deportivo y cocinero práctico. Hablas en español de España, tuteas, eres directo, concreto y cercano, sin sermones. Conoces sus datos reales (JSON de abajo), incluido un modelo bayesiano que ha aprendido su gasto real y cuánto mueven su báscula el agua y la comida.\n\n' +
+      'OBJETIVO: que cumpla su objetivo de hoy lo mejor posible (o se desvíe lo mínimo) y avance hacia su meta comiendo cosas que tenga y le apetezcan.\n' +
+      'REGLAS:\n' +
+      '- Si pregunta qué comer: propón 1-3 opciones en "opciones", usando PRIMERO lo que hay en "nevera" (si está vacía, cosas normales de un súper español). Ajusta los gramos para que encajen en lo que le QUEDA hoy repartido entre "comidas_por_delante", priorizando llegar a la proteína. Si ya se ha pasado, propón lo más ligero y saciante y dile cómo lo compensa la app (compensacion_kcal) sin agobiarse.\n' +
+      '- Para "planifícame el resto del día": una opción por cada comida que le queda; entre todas deben sumar lo que le queda (±5 %).\n' +
+      '- Cada alimento con gramos realistas (di en el nombre si es crudo o cocinado) y kcal, proteína, hidratos y grasa de ESA cantidad, con valores de BEDCA o etiquetas españolas. Cuenta el aceite, las salsas y el pan.\n' +
+      '- "pasos": receta breve, máximo 4 pasos con tiempos reales. "tipo": la comida del día que toca por la hora.\n' +
+      '- Respeta "gustos_y_restricciones" (alergias y lo que no come). Inspírate en "alimentos_habituales" para acertar con sus gustos.\n' +
+      '- En un restaurante: dile qué pedir y qué evitar, con kcal aproximadas, y pon lo que pediría como opción para que lo pueda añadir.\n' +
+      '- Si pregunta por su peso o su progreso, explícalo con "modelo" (peso real frente a agua, gasto real, previsión, precisión) y cifras concretas.\n' +
+      '- Si dice que se le ha acabado algo, que ha comprado algo o que ha usado algo, actualiza "nevera_quitar" / "nevera_anadir" (nombres cortos, en minúscula).\n' +
+      '- Si hay foto: si es una nevera o despensa, pon lo que ves en "nevera_anadir"; si es una carta o un plato, ayúdale a elegir.\n' +
+      '- Nada de consejos médicos. "respuesta" breve (máx. 110 palabras) en Markdown sencillo (**negrita**, listas con -). Si no hacen falta opciones, "opciones": [].\n' +
+      'Responde ÚNICAMENTE con JSON válido: {"respuesta":"...","opciones":[{"nombre":"...","tipo":"Desayuno|Comida|Merienda|Cena|Snack","por_que":"...","pasos":["..."],"alimentos":[{"n":"...","g":0,"k":0,"p":0,"c":0,"f":0}]}],"nevera_quitar":[],"nevera_anadir":[]}\n\n' +
+      'DATOS:\n' + JSON.stringify(chatContext()) + (hist ? '\n\nCONVERSACIÓN PREVIA:\n' + hist : '') + '\n\nMENSAJE ACTUAL' + (hasPhoto ? ' (con foto adjunta)' : '') + ': ' + (text || '(mira la foto)');
+  }
+  function cleanOpts(list) {
+    return (Array.isArray(list) ? list : []).slice(0, 4).map(function (o) {
+      var items = (Array.isArray(o.alimentos || o.items) ? (o.alimentos || o.items) : []).map(function (i) {
+        var p = Math.max(0, CC.num(i.p)), c = Math.max(0, CC.num(i.c)), f = Math.max(0, CC.num(i.f)), k = CC.num(i.k) > 0 ? CC.num(i.k) : 4 * p + 4 * c + 9 * f;
+        return { n: String(i.n || i.nombre || 'Alimento').slice(0, 80), g: Math.round(Math.max(0, CC.num(i.g))), k: Math.round(k), p: CC.round(p, 1), c: CC.round(c, 1), f: CC.round(f, 1) };
+      }).filter(function (i) { return i.k > 0; });
+      var t = totalsOf(items), ty = String(o.tipo || o.type || '');
+      return { name: String(o.nombre || o.name || 'Propuesta').slice(0, 80), type: MEALS.some(function (m) { return m[0] === ty; }) ? ty : guessType(), why: String(o.por_que || o.why || '').slice(0, 300),
+        steps: (Array.isArray(o.pasos) ? o.pasos : []).map(function (s) { return String(s).slice(0, 240); }).slice(0, 6), items: items, k: Math.round(t.k), p: CC.round(t.p, 1), c: CC.round(t.c, 1), f: CC.round(t.f, 1) };
+    }).filter(function (o) { return o.items.length; });
+  }
+  async function chatSend(text) {
+    var c = V.chat; text = String(text != null ? text : c.input || '').trim();
+    if (c.busy || (!text && !c.photo)) return;
+    if (aiMode() === 'none') { c.err = 'La IA no está disponible (¿sesión iniciada y clave de IA en Vercel?).'; renderSheet(); return; }
+    var log = chatLog(); log.push({ r: 'u', t: text || 'Mira esta foto', ph: !!c.photo, ts: Date.now() }); chatSave(log);
+    var photo = c.photo; c.input = ''; c.photo = null; c.busy = true; c.err = ''; renderSheet(); scrollChat();
+    try {
+      var r = await aiJson(chatPrompt(text, log, !!photo), photo);
+      var msg = { r: 'a', t: String(r.respuesta || r.reply || r.text || '').slice(0, 4000), opts: cleanOpts(r.opciones || r.options), ts: Date.now() };
+      if (!msg.t && !msg.opts.length) throw { code: 'parse' };
+      var add = (r.nevera_anadir || r['nevera_añadir'] || []).map(String).filter(Boolean), del = (r.nevera_quitar || []).map(function (x) { return String(x).toLowerCase().trim(); }).filter(Boolean);
+      if (add.length || del.length) {
+        setFridge(fridge().filter(function (n) { var l = n.toLowerCase(); return !del.some(function (x) { return l === x || l.indexOf(x) >= 0 || x.indexOf(l) >= 0; }); }).concat(add));
+        msg.fr = { add: add, del: del };
+      }
+      log = chatLog(); log.push(msg); chatSave(log);
+    } catch (e) { c.err = aiErr(e); }
+    c.busy = false; if (V.sheet === 'chat') { renderSheet(); scrollChat(); }
+  }
+  async function fridgePhoto(file) {
+    var c = V.chat; c.frbusy = true; c.err = ''; renderSheet();
+    try {
+      var ph = await (window.__prepPhoto || prepPhoto)(file);
+      var r = await aiJson('Mira esta foto de una nevera, congelador o despensa y enumera los alimentos que se ven, con nombres cortos en español y en minúscula (p. ej. "huevos", "pechuga de pollo", "yogur griego", "tomate frito"). No inventes lo que no se ve. Responde ÚNICAMENTE con JSON: {"alimentos":["..."]}', ph);
+      var list = (r.alimentos || r.items || []).map(String).filter(Boolean);
+      if (!list.length) throw { code: 'parse' };
+      setFridge(fridge().concat(list)); toast('🧊 ' + list.length + ' cosas añadidas a la nevera');
+    } catch (e) { c.err = aiErr(e); }
+    c.frbusy = false; if (V.sheet === 'chat') renderSheet();
+  }
+  var CHAT_ACTIONS = {
+    chef: function () { V.sheet = null; openChat(); },
+    'm-chef': function () { openChat(); },
+    chatsend: function () { var el = $('#chatin'); if (el) V.chat.input = el.value; chatSend(); },
+    chatq: function (t) { chatSend(QUICK[+t.dataset.i]); },
+    chatclear: function () { chatSave([]); V.chat.err = ''; renderSheet(); },
+    chatfridge: function () { V.chat.showFridge = !V.chat.showFridge; renderSheet(); },
+    chatphoto: function () { if (V.chat.photo) { V.chat.photo = null; renderSheet(); return; } var i = $('#chatPhotoIn'); if (i) i.click(); },
+    frphoto: function () { var i = $('#frPhotoIn'); if (i) i.click(); },
+    fradd: function () { var el = $('#frin'); if (!el || !el.value.trim()) return; setFridge(fridge().concat(el.value.split(/[,;\n]+/))); renderSheet(); var n = $('#frin'); if (n) n.focus(); },
+    frdel: function (t) { var l = fridge().slice(); l.splice(+t.dataset.i, 1); setFridge(l); renderSheet(); },
+    frclear: function () { setFridge([]); renderSheet(); },
+    chatadd: function (t) {
+      var log = chatLog(), m = log[+t.dataset.i], o = m && m.opts && m.opts[+t.dataset.j]; if (!o || o.added) return;
+      var day = dayOf(TODAY, true); day.meals = day.meals || [];
+      day.meals.push({ id: uid(), u: Date.now(), t: nowHM(), type: o.type, name: o.name, k: o.k, p: o.p, c: o.c, f: o.f, items: o.items.map(function (i) { return { n: i.n, g: i.g, k: i.k, p: i.p, c: i.c, f: i.f, conf: 'media' }; }) });
+      touchDay(TODAY); o.added = true; chatSave(log); renderSheet(); toast('Añadido a hoy · ' + fmt(o.k) + ' kcal');
+    }
+  };
+  Object.keys(CHAT_ACTIONS).forEach(function (k) { ACTIONS[k] = CHAT_ACTIONS[k]; });
+  async function chatFileChange(t) {
+    var f = t.files && t.files[0]; try { t.value = ''; } catch (x) {} if (!f) return;
+    if (t.id === 'frPhotoIn') { fridgePhoto(f); return; }
+    try { V.chat.photo = await (window.__prepPhoto || prepPhoto)(f); } catch (e) { V.chat.err = 'No he podido leer esa foto.'; }
+    renderSheet(); var el = $('#chatin'); if (el) el.focus();
+  }
 
   /* ====================== Arranque ====================== */
   function importHealth(txt, atMin) {
